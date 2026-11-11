@@ -1,0 +1,4328 @@
+# Changelog
+
+All notable changes to this module are documented here. The format
+follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+this project adheres to the stability contract in
+[README.md → Stability & versioning](./README.md#stability--versioning).
+
+## [Unreleased]
+
+## [0.6.0] - 2026-10-26
+
+Minor release per the [stability contract](./README.md#stability--versioning).
+Several changes below are breaking. Read the upgrade notes under **Added**,
+**Changed** and **Fixed** before you upgrade. Pin this module to `~> 0.5.0`
+to stay on the previous line.
+
+**Breaking changes**, each with its own upgrade note below:
+
+- The minimum Terraform version is now `>= 1.13` (was `>= 1.11`). On 1.12
+  or older, `terraform init` stops before planning anything.
+- With module-managed EKS, the first apply replaces `aws_eks_node_group.n8n`.
+  The new group is created before the old one is deleted, so the account
+  needs EC2 quota and subnet IPs for both at once. Pods on the old nodes are
+  evicted. Selectors on the old `n8n-nodes` name stop matching. Node root
+  volumes are now encrypted with the region's default EBS key: if that is a
+  customer managed key, its policy must allow the Auto Scaling service-linked
+  role, or the new nodes fail to launch. Run the upgrade in a low-traffic
+  maintenance window.
+- Turning `eks_secrets_encryption_enabled` from `true` to `false` on an
+  existing cluster now fails at apply instead of replacing the cluster.
+- `N8N_PROXY_HOPS` and `N8N_GRACEFUL_SHUTDOWN_TIMEOUT` are now rejected at
+  plan time in `n8n_extra_env`, `n8n_worker_extra_env` and
+  `n8n_worker_pools[*].extra_env`. Use `n8n_proxy_hops` and
+  `n8n_graceful_shutdown_timeout` instead.
+- A caller who sets `n8n_webhook_hpa_min_replicas` above 4 without setting
+  `n8n_webhook_hpa_max_replicas` now fails at plan, because that default
+  dropped from `8` to `4`.
+- `n8n_worker_keda_min_replicas = 0` no longer removes the default workers.
+  The next apply creates a worker Deployment and `ScaledObject`, starts one
+  worker, and that worker runs any backlog on the default queue.
+- `random_password.db_password` moves to `random_password.db_password[0]`.
+  A `moved` block handles state; only scripts that target the old address
+  need a change.
+
+**What moves on apply** for a caller who changes nothing but the module
+source pin. Items that depend on a default apply only where the caller has
+not set that input, and items about EKS, controllers or Redis apply only
+where the module manages them:
+
+- `aws_eks_node_group.n8n` is replaced, as described above.
+- `n8n_chart_version` `1.11.0` to `1.16.0`: `helm upgrade` rolls every n8n
+  pod. With `n8n_image_tag = null`, the image moves from the floating
+  `stable` tag to the selected chart's default `appVersion` (`2.43.5` for
+  the upstream chart `1.16.0`), across n8n's database migrations. **Pin the
+  running application version first** to avoid an unintended downgrade or
+  upgrade. Crossing from below chart `1.13.0` to `1.13.0` or newer can
+  terminate surplus worker pods; KEDA is expected to restore the floor. In
+  queue mode, task runners now run only on workers, and the worker runner
+  gains a liveness probe. On single-main, Helm deletes the `n8n-main`
+  PodDisruptionBudget. See [`docs/upgrading-n8n.md`](./docs/upgrading-n8n.md).
+- `lbc_chart_version` `3.5.0` to `3.6.0` and `keda_chart_version` `2.20.2`
+  to `2.21.0`: in-place controller upgrades. KEDA is cluster-wide, so read
+  its 2.21 migration guide first on a shared cluster.
+- Every n8n pod gains `N8N_PROXY_HOPS=1`, loses the deprecated `WEBHOOK_URL`
+  where the image is proven to be n8n `2.30.0` or newer, and, at the default
+  `db_postgresdb_pool_size`, gets `DB_POSTGRESDB_POOL_SIZE=9` (was 10).
+- The webhook processor HPA `maxReplicas` drops to 4.
+- The module creates a Redis parameter group with `maxmemory-policy =
+  noeviction` and attaches it to the cache in place.
+- Taggable AWS resources the module manages gain the `aws-apn-id` tag in
+  place (Route 53 validation and alias records cannot be tagged), and the
+  EBS CSI addon is reconfigured to tag new volumes. Existing volumes and the
+  addon's own Pod Identity association keep their tags. Set
+  `aws_partner_attribution_tag = ""` to opt out.
+- New PodDisruptionBudgets for webhook processors, the default workers and
+  the AWS Load Balancer Controller. Worker pool Deployments from
+  `n8n_worker_pools` are not covered. Check for budgets you already run that select the
+  same pods before you upgrade.
+- In the examples: `medium` turns on RDS storage autoscaling, and
+  `worker-pools` requests an in-place resize to `db.t3.medium`, which
+  interrupts database availability when it runs.
+
+### Added
+
+- `n8n_extra_ca_pem` makes the n8n containers trust extra CA certificates for
+  outbound TLS, for a TLS-inspecting egress proxy or a private CA. The module
+  stores the PEM in a module-managed Secret (certificates only; a private key
+  is rejected at plan time), mounts it read-only at
+  `/etc/n8n-certs/ca-bundle.crt` on main, worker and webhook-processor pods,
+  and sets `NODE_EXTRA_CA_CERTS`. Changing the PEM rolls the pods through a
+  `checksum/extra-ca` annotation. `NODE_EXTRA_CA_CERTS`, the `ca-bundle`
+  volume name and that mount path are reserved only while the input is set. The
+  task runner sidecar does not inherit it. Every example now also exposes
+  `n8n_extra_ca_pem`, `n8n_proxy_hops` and `n8n_extra_env`. See
+  [docs/tls-proxy.md](./docs/tls-proxy.md), which also covers the inbound case
+  (`n8n_proxy_hops`).
+- `lbc_pdb_enabled` (default `true`) renders a PodDisruptionBudget with
+  `maxUnavailable = 1` for the AWS Load Balancer Controller, so a node drain no
+  longer stops both replicas at once. During the live test of #200 both were
+  stopped together, which probably caused one 502. Set it to `false` to opt out.
+  Existing deployments gain the budget on the next apply (a Helm values change
+  to the `aws-load-balancer-controller` release). Ignored when
+  `install_lbc = false`.
+- `n8n_webhook_pdb_enabled` and `n8n_worker_pdb_enabled` (both default `true`)
+  create PodDisruptionBudgets with `maxUnavailable = 1` for the webhook
+  processor and default worker Deployments. The n8n chart renders a budget for
+  the main pods only, so a node group replacement previously stopped every
+  webhook processor and the only worker in the same second (observed in the
+  live test of #200). `maxUnavailable` rather than `minAvailable`, so a
+  one-replica worker never blocks a drain; that also means the worker budget
+  protects nothing until KEDA runs two or more workers. Worker pool
+  Deployments are not covered. EKS can still terminate nodes after a node group
+  deletion timeout without honoring budgets. Set either to `false` to manage
+  your own.
+- Upgrade note for the three budgets above: before upgrading, run
+  `kubectl get pdb -A -o yaml` and compare each budget's `spec.selector` with
+  the labels of the n8n webhook processor and worker pods and of the AWS Load
+  Balancer Controller pods in `kube-system`. If a budget you already run
+  selects them, set the matching `n8n_webhook_pdb_enabled`,
+  `n8n_worker_pdb_enabled` or `lbc_pdb_enabled` to `false`. When two budgets
+  select the same running pod, the Eviction API rejects its eviction with an
+  error even if both budgets allow a disruption, so `kubectl drain`, node group
+  updates and Cluster Autoscaler scale-down can fail or stall.
+  A budget you already own named `n8n-webhook-processor` or `n8n-worker` in
+  the n8n namespace makes the apply fail with "already exists".
+- `aws_partner_attribution_tag` adds the tag `aws-apn-id` to every taggable
+  resource the module creates, through `local.common_tags`; to the ALB and the
+  listeners, target groups and security groups the AWS Load Balancer Controller
+  creates, through the controller's `defaultTags` when `install_lbc` is true;
+  and to every EBS volume the EBS CSI driver provisions, through the addon's
+  `controller.extraVolumeTags` when `create_ebs_csi` is true. AWS Partner
+  Revenue Measurement uses it to attribute the spend to n8n. It defaults to the
+  product code of n8n's AWS Marketplace container listing. The input owns the
+  tag: an `aws-apn-id` key in `tags` is ignored, and `""` removes the tag from
+  the resources Terraform manages and stops the controller adding it to the load
+  balancers it creates. Every example takes the same input and merges it into
+  its own tags, so its VPC and Redis, RDS and S3 stand-ins carry it too; the
+  stand-in EKS clusters in `customer-managed-cluster` and
+  `customer-managed-everything` tag their node groups only. The EKS-created
+  cluster security group stays untagged, because EKS does not copy tags to it
+  and the module leaves that EKS-owned group unmanaged. Upgrade note: the first plan after
+  upgrading updates the tags of every tagged resource in place, upgrades the AWS
+  Load Balancer Controller release and reconfigures the EBS CSI addon, which
+  tags volumes it provisions from then on; volumes that already exist are not
+  retagged, and opting out does not untag them. The one Pod Identity
+  association owned by the EBS CSI addon keeps its old tags until the addon is
+  recreated. See README.md → AWS Partner Revenue Measurement tag.
+- `node_launch_template_enabled` (default `true`) attaches an
+  `aws_launch_template` to `aws_eks_node_group.n8n` so the worker EC2
+  instances, their root EBS volumes and their primary network interfaces carry
+  `local.common_tags`, including `aws-apn-id`, which EKS does not copy from
+  the node group itself (#198). `node_disk_size` now reaches the launch
+  template's `block_device_mappings` instead of the node group's own
+  `disk_size`, which the EKS API rejects once a launch template is attached;
+  the resulting volume size is unchanged. The launch template also sets
+  `encrypted = "true"` on the root volume, so node root volumes are encrypted
+  at rest with the region's default EBS key even where EBS encryption by
+  default is off; a customer managed default EBS key must let the Auto
+  Scaling service-linked role use the key and create grants, or new nodes
+  fail to launch. Attaching the launch template replaces the node group; see
+  the breaking node group entry under Changed. See README.md → AWS Partner
+  Revenue Measurement tag.
+- A plan-time advisory `check.db_postgresdb_pool_size_fits_known_max_connections`
+  (`database.tf`) warns when `db_postgresdb_pool_size` times the modeled main,
+  worker, webhook-processor, and `n8n_worker_pools` replica ceilings would
+  exceed the connections n8n can use on the selected `db_instance_class`:
+  `max_connections` from a curated table, minus the 7 slots PostgreSQL 18.6
+  on RDS reserves for superusers (`superuser_reserved_connections`, 3) and
+  RDS's internal role (`rds.rds_reserved_connections`, 4). While
+  `n8n_worker_keda_pause = true`, the worker term uses
+  `n8n_worker_keda_paused_replica_count` when that is larger than
+  `n8n_worker_keda_max_replicas`
+  ([#180](https://github.com/n8n-io/terraform-aws-n8n/issues/180)). The `db.t3.small`
+  entry is measured on a live instance (191; RDS's formula against nominal
+  memory would give 225), and `db.t4g.small`, which has the same nominal
+  memory, reuses that figure without being measured. The other entries evaluate
+  `LEAST({DBInstanceClassMemory/9531392}, 5000)` against nominal memory and
+  are not measured, so the live value can be lower and silence does not
+  prove the ceilings fit; confirm the live connection budget
+  (`SHOW max_connections`, reserved connections, and other clients). The
+  check stays silent for classes outside the table and for
+  `create_database = false`. This is documented in the new
+  [`docs/sandbox.md`](./docs/sandbox.md), alongside a cheaper single-main
+  sandbox profile built from existing inputs.
+- `docs/shared-responsibility.md`: a single table summarizing what the
+  module does versus what the caller owns across cluster security add-ons,
+  network egress and DNS, secrets and Terraform state custody, backup and
+  restore, upgrades, and monitoring/alerting, linked from the README
+  "Out of scope" section and the Usage section.
+
+- `docs/build-time-decisions.md`, a single table of settings that are
+  fixed or constrained after the first `terraform apply` (EKS cluster
+  name, subnet removal, service CIDR, authentication mode, and secrets
+  encryption; node group instance type and disk size; RDS engine,
+  storage encryption and subnet removal; ElastiCache topology, transit
+  and at-rest encryption; the S3 bucket name and its KMS encryption
+  toggle; the ALB ingress scheme; and the n8n encryption key), what
+  happens if you change each one later, and what to do instead. Linked
+  from `README.md` and every example's "Production considerations"
+  section.
+
+- **`n8n_proxy_hops`** (default `1`, renders `N8N_PROXY_HOPS` on every n8n
+  pod via `config.extraEnv`). Unless a caller set it through `n8n_extra_env`,
+  n8n ran with its own default of `0` behind the module's ALB: Express trusted
+  no proxy, so n8n took the client IP from the ALB's own connection and
+  ignored `X-Forwarded-For` and `X-Forwarded-Proto`. The default of `1`
+  matches an ALB alone, whether the module or the caller owns the Ingress.
+  Each HTTP proxy in front of the ALB that adds an `X-Forwarded-For` entry,
+  such as CloudFront, adds one hop, with either `create_ingress` setting. A value above `1` is only safe when the
+  inner proxy accepts traffic from the outer one alone, otherwise a client
+  can forge its IP. Rejects non-integer or negative values at plan time.
+  README.md's "Customer-managed Ingress" section documents session
+  stickiness and the hop count beside the path-prefix rules, and
+  `docs/istio-ingress.md` covers both for an Istio gateway.
+
+  **Upgrade note (breaking):** the env var name is now reserved in
+  `local.n8n_managed_env_names`. It matches none of the guard prefixes and
+  was absent from the exact-match list, so callers could set it through the
+  escape hatches. An `N8N_PROXY_HOPS` entry in `n8n_extra_env`,
+  `n8n_worker_extra_env` or `n8n_worker_pools[*].extra_env` now fails
+  variable validation at plan time and must move to `n8n_proxy_hops`. The new
+  input sets one value for every pod type, so a different value per pod type
+  is no longer possible. Every n8n pod (main, worker, webhook processor)
+  rolls once on the next apply because the env list changes, and from then on
+  n8n uses the forwarded client IP and protocol instead of the ALB's own
+  address. This makes the change a minor-version
+  boundary under [Stability & versioning](./README.md#stability--versioning),
+  not a patch.
+
+- **`redis_maxmemory_policy`** (default `"noeviction"`, validated against the
+  ElastiCache Redis/Valkey maxmemory-policy enum). Wired into a new
+  module-managed `aws_elasticache_parameter_group` (family `redis7`,
+  attached via `parameter_group_name` to both `aws_elasticache_cluster.n8n`
+  and `aws_elasticache_replication_group.n8n`, whichever topology is
+  active). Without this, both topologies ran on the `redis7` family's
+  *default* parameter group, whose AWS-documented `maxmemory-policy`
+  default for node-based clusters is `volatile-lru`: once Redis fills up it
+  evicts keys carrying a TTL, and some of n8n's Bull queue keys (job locks)
+  carry one, so queue state could be silently removed under memory
+  pressure. `noeviction` makes a full Redis reject writes with an
+  out-of-memory error instead. That covers more than enqueue: Bull lock
+  renewals fail too (n8n does not retry a stalled job), and n8n's cache
+  shares this Redis in queue mode, so size and alert on memory for both.
+  **Upgrade impact:** existing deployments change behavior on the next
+  apply. `parameter_group_name` does not force replacement on either
+  ElastiCache resource type (AWS provider schema), so the first apply
+  creates the group and modifies the cache in place. On the default
+  single-node cluster this took effect immediately in a live test even with
+  `redis_apply_immediately = false` (in-sync in about 40 seconds, no
+  reboot), so it is not deferred to the maintenance window. The replication
+  group topology is not verified live and may wait for the window unless
+  `redis_apply_immediately = true`, which also applies any other pending
+  modification. A custom
+  parameter group attached outside Terraform is replaced; check yours
+  first. To keep the old eviction behavior, set
+  `redis_maxmemory_policy = "volatile-lru"`. **Rollback:** pinning an
+  earlier module version alone fails, because the cache stays attached to
+  the module's group and AWS refuses to delete a group in use. Attach
+  `default.redis7` to the cache first; README → "Redis eviction policy"
+  has the commands. Extends
+  `check.redis_tuning_requires_module_managed_elasticache` to also warn when
+  this is set while `create_elasticache = false`. The
+  `customer-managed-redis` and `customer-managed-everything` examples' own
+  stand-in replication groups now also run `noeviction` on a matching
+  stand-in parameter group, as a good-practice example for a caller-owned
+  Redis feeding n8n's Bull queue. See README → "Redis eviction policy".
+
+- **`db_postgresdb_ssl_reject_unauthorized` and `db_postgresdb_ssl_ca_pem`**
+  close the certificate-verification gap on the module's direct PostgreSQL TLS
+  connection: `db_postgresdb_ssl_enabled` (existing) already encrypted the
+  connection but hardcoded `DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false`,
+  skipping verification outright, because AWS's RDS server certificate
+  chains to Amazon's own RDS-specific CA (`rds-ca-rsa2048-g1` and friends),
+  not a root in Node.js's default trust store. Setting
+  `db_postgresdb_ssl_reject_unauthorized = true` turns verification on;
+  `db_postgresdb_ssl_ca_pem` supplies the RDS CA bundle for your region
+  (`https://truststore.pki.rds.amazonaws.com/<region>/<region>-bundle.pem`).
+  The module passes the bundle, with surrounding whitespace trimmed, to the
+  n8n Helm chart's `database.ssl.ca` value, which the chart renders into its
+  own ConfigMap as `DB_POSTGRESDB_SSL_CA` for the main, worker, and
+  webhook-processor pods. Because the CA is part of the Helm release, a
+  failed upgrade's atomic rollback restores the previous CA, removing the CA
+  is a Helm-only change, and the chart's `checksum/config` annotation rolls
+  the pods when the CA changes (#178). The trimmed bundle may be at most
+  131,050 bytes, checked at plan time: the chart passes it to each container
+  as an environment variable, and Linux refuses to start a container whose
+  single environment string exceeds 128 KiB. That rules out the combined
+  `global-bundle.pem` (about 170 KB); concatenate the regional bundles you
+  need instead. The bundle must also be ASCII text. Both inputs default to the
+  prior behavior (`false` / `null`), so deployments that leave both at their
+  defaults see no plan diff. Deployments built from unreleased `main` with
+  `db_postgresdb_ssl_ca_pem` already set switch on upgrade from the earlier
+  module-managed ConfigMap and mount to the chart value; if that one upgrade
+  fails and rolls back, recreate the ConfigMap (see `docs/postgresql-tls.md`,
+  "Upgrading from an unreleased build"). A non-blocking `check` warns when
+  a CA is supplied without verification actually turned on, and another when
+  verification is requested while `db_postgresdb_ssl_enabled = false`, so the
+  input is never silently inert. See
+  [`docs/postgresql-tls.md`](./docs/postgresql-tls.md) for the full
+  procedure, the bundle size limit, the `db_host` hostname requirement, AWS's
+  CA rotation schedule, what a wrong bundle does during an upgrade, and the
+  PgBouncer caveat (`examples/large`): PgBouncer terminates TLS on its own
+  upstream leg to Aurora, which this module has no visibility into.
+
+- **`db_password_write_only`, `db_password_wo`, and
+  `db_password_wo_version`** let the module-managed RDS instance
+  (`create_database = true`) accept its master password through
+  `aws_db_instance.n8n`'s write-only `password_wo` argument instead of a
+  `random_password` resource whose result Terraform stores in plain text in
+  state. `db_password_wo` is an `ephemeral` module variable, so the module
+  never writes the value to a plan or state file. Pass it from an ephemeral
+  root input variable or an ephemeral resource as well: a non-ephemeral root
+  input variable is saved in the caller's plan file. This mode requires
+  `db_password_secret_ref` (the module cannot copy a write-only value into
+  the Kubernetes Secret it would otherwise manage), makes the `db_password`
+  output `null`, and is fully opt-in: the default
+  (`db_password_write_only = false`) behavior is unchanged. Write-only
+  arguments need Terraform 1.11 or newer and AWS provider `5.88.0` or newer,
+  which the module's own constraints already satisfy, so this feature raises
+  no version floor. Safe to enable from the first apply of a
+  new deployment. On an existing password-managed instance, follow the
+  migration recipe in README.md -> "Switching to the write-only RDS password"
+  instead of flipping it directly, because of an open AWS provider bug
+  (hashicorp/terraform-provider-aws#42582; fix proposed in provider PR #47904
+  but not yet merged). It did not reproduce in a live test on the locked
+  provider (6.65.0), and the recipe is correct either way. `db_password_wo`
+  is validated against the RDS for PostgreSQL master password rules (8 to 128
+  printable ASCII characters, no `/`, `"`, `@` or space), and an empty value is
+  rejected: the provider silently skips an empty write-only password on
+  update, which would turn a rotation into a no-op.
+
+  **Upgrade note (resource address):** `random_password.db_password` gains a
+  `count`, so its address becomes `random_password.db_password[0]`.
+  `refactoring.tf` carries the `moved` block, so with
+  `db_password_write_only` left at `false` the move itself changes nothing:
+  the generated password, the RDS instance and `kubernetes_secret.n8n_db`
+  keep their values, and no action is needed. Other changes in the same
+  upgrade, or drift, can still show up in that plan. A script that targets the old address (for example
+  `-replace=module.n8n.random_password.db_password`) must add the `[0]`.
+  Downgrading to an earlier module version needs no state command either:
+  Terraform moves `random_password.db_password[0]` back to the old address
+  on its own, as long as write-only mode is off. First remove
+  `db_password_write_only`, `db_password_wo` and `db_password_wo_version`
+  from the module call, even when they are set to their defaults: an
+  earlier version does not declare them and rejects them as unsupported
+  arguments. Both directions were verified on a live `examples/small`
+  deployment, with no change to the password, the RDS instance or the
+  Secret.
+  Under [Stability & versioning](./README.md#stability--versioning) a
+  changed resource address is a minor-version boundary, not a patch.
+
+- **`db_max_allocated_storage`** (number, default `null`) enables RDS
+  Storage Autoscaling on the managed PostgreSQL instance, mapped to
+  `max_allocated_storage` on `aws_db_instance.n8n`. `null` (the default)
+  leaves it unset, so autoscaling stays off and existing deployments see no
+  plan change. When set, AWS grows `allocated_storage` automatically
+  as free space runs low, up to this ceiling. Must be a whole number of GiB
+  at least 10% greater than `db_allocated_storage` (AWS's own floor for the
+  ceiling; anything less fails at apply with "Invalid max storage size")
+  and at most 65536 GiB (RDS PostgreSQL's 64 TiB ceiling). The AWS provider
+  hides the resulting `allocated_storage` drift from the next plan once
+  `max_allocated_storage` is configured, so no `lifecycle.ignore_changes`
+  is required while autoscaling stays on. Setting this input back to `null`
+  ends that suppression: in the same apply, raise `db_allocated_storage` to
+  the live size, or the plan proposes shrinking storage, which AWS rejects.
+  Raising `db_allocated_storage` first, on its own, can fail the 10%
+  validation. The validations are written so they also work on Terraform
+  1.11, which does not short-circuit `||`. Set to `400` in the `medium`
+  example. Triggers a non-blocking check warning when
+  `create_database = false`, alongside the other managed-instance sizing
+  inputs.
+
+- **`n8n_task_runner_image_repository`** (default `null`, chart
+  `taskRunners.image.repository`). Overrides the task runner sidecar's image
+  repository (`n8nio/runners` by default), independently of
+  `n8n_image_repository`, so the application and runner images can live in
+  different repositories on the same private mirror. Same bare-repository
+  validation (no scheme, tag, or digest) as `n8n_image_repository`. Setting
+  it with `n8n_task_runners_enabled = false` now warns
+  (`check.task_runner_image_repository_requires_task_runners`), and a
+  repository with no corresponding `n8n_task_runner_image_tag` now warns too
+  (`check.custom_task_runner_repository_needs_an_explicit_tag`), since the
+  tag then falls back to `n8n_image_tag` or the chart's default, either of
+  which may not exist in a private mirror. In that case it replaces
+  `check.custom_image_tag_needs_a_task_runner_tag`, which now only covers the
+  default `n8nio/runners` repository, so the two never fire together.
+  `check.image_pull_secrets_need_a_custom_image` no longer warns on
+  `n8n_image_pull_secrets` when only this repository, not
+  `n8n_image_repository`, is set and task runners are enabled. All eleven
+  examples expose the new input as a passthrough variable, matching
+  `n8n_image_repository`'s existing shape.
+
+- **`eks_network_policy_enabled`** input (default `false`). When true, the
+  module adopts the cluster's self-managed vpc-cni into an EKS-managed
+  `aws_eks_addon.vpc_cni` (`resolve_conflicts_on_create = "OVERWRITE"`,
+  needed because EKS bootstraps vpc-cni as a self-managed workload at
+  cluster creation) and sets `configuration_values` to turn on the VPC
+  CNI's native Kubernetes NetworkPolicy enforcement
+  (`enableNetworkPolicy = "true"`). A plan-time validation requires
+  `kubernetes_version` 1.27 or later, the module's minor-version floor.
+  AWS documents 1.26.7 (platform `eks.6`) or 1.27.4 (`eks.5`) as the
+  minimum; the validation checks the minor version only. The validation is skipped when
+  `create_eks = false`. Creates no Kubernetes NetworkPolicy objects itself
+  (write your own once enforcement is on); enforcement applies to every
+  NetworkPolicy in the cluster. This is the port of terraform-azurerm-n8n
+  PR #44's `aks_network_policy` to EKS's addon-based equivalent. Default
+  false leaves EKS's own self-managed vpc-cni untouched, so every existing
+  caller sees no plan diff. Ignored, with a plan-time warning
+  (`check.existing_eks_cluster_needs_its_own_network_policy_toggle`),
+  when `create_eks = false`: the module manages no vpc-cni addon on an
+  existing cluster. Incompatible with a root module that already manages
+  its own `aws_eks_addon` for the same cluster's vpc-cni (e.g.
+  `examples/large`'s `WARM_ENI_TARGET`/`WARM_IP_TARGET` tuning); see the
+  variable's description. Adopting with `OVERWRITE` resets any existing
+  vpc-cni configuration, including hand-edited `aws-node` DaemonSet
+  settings that predate this addon, to the addon's own defaults plus the
+  module's single key, and
+  `resolve_conflicts_on_update = "OVERWRITE"` applies the same reset on
+  any later addon update. The module exposes no other vpc-cni settings.
+  The addon sets `preserve = true`, so flipping the toggle back to
+  `false` leaves the running vpc-cni DaemonSet in place as a self-managed
+  installation instead of EKS deleting it, avoiding a pod-networking
+  outage. **That also means `false` does not disable enforcement** once it
+  has been on; README → "Kubernetes NetworkPolicy enforcement" links AWS's
+  disable procedure.
+
+- **`n8n_license_cert_secret_ref`** supports offline license activation
+  (`N8N_LICENSE_CERT`) for air-gapped or egress-restricted clusters that
+  cannot reach n8n's license server. It is mutually exclusive with
+  `n8n_license_key` and `n8n_license_key_secret_ref`: exactly one of the
+  three must be set. The certificate renders through the shared
+  `config.extraEnv` list as a `secretKeyRef`, not through the chart's
+  `license.existingSecret` block, which only ever maps to
+  `N8N_LICENSE_ACTIVATION_KEY`. `license.enabled` stays `true` on this path
+  because the chart also gates `N8N_MULTI_MAIN_SETUP_ENABLED` on
+  `license.enabled`, not on which credential backs it. Tested live on
+  `examples/small`: offline activation, worker execution, multi-main
+  leader election, and switching back to a license key. The certificate
+  must match n8n's instance ID; pin it with `N8N_INSTANCE_ID` through
+  `n8n_extra_env` rather than changing the encryption key. See ["Offline
+  license activation"](./README.md#offline-license-activation).
+
+- **`n8n_worker_keda_pause` and `n8n_worker_keda_paused_replica_count`**
+  (chart `keda.worker.pause` / `pausedReplicaCount`). `pause = true`
+  annotates the default worker `ScaledObject` with
+  `autoscaling.keda.sh/paused` so workers hold their current count; a
+  `paused_replica_count` (0 included) adds `paused-replicas` and scales to
+  that count while jobs wait in Redis. `n8n_worker_pools` pools are not
+  paused. Supported from chart `1.13.0`: the key shipped in `1.12.0`, but
+  that release still sets the worker's `spec.replicas` on every Helm
+  upgrade and would override a held count. Two plan-time warnings cover
+  the inert cases: a count without `pause`
+  (`check.worker_keda_paused_replica_count_requires_pause`) and a chart
+  older than `1.13.0` (`check.worker_keda_pause_requires_a_supported_chart`).
+  Same input names and semantics as terraform-azurerm-n8n and
+  terraform-google-n8n. The chart's matching `keda.webhookProcessor.pause` is
+  not exposed: this module scales webhook processors with its own HPA
+  (`scaling.tf`), so no webhook `ScaledObject` exists for the annotation to
+  land on. While both inputs are unset the module sends no pause keys to the
+  chart, so existing releases see no Helm values change from this addition.
+- **`n8n_graceful_shutdown_timeout`** (chart `redis.worker.timeout`, renders
+  `N8N_GRACEFUL_SHUTDOWN_TIMEOUT`). Seconds n8n waits for in-flight
+  executions to finish on SIGTERM before exiting on its own. Must go through
+  this input rather than any `extra_env` input: chart `1.13.0` renders this
+  ConfigMap key unconditionally on every n8n container, and `extraEnv` is
+  appended after it, so a caller duplicate doesn't fail, Kubernetes silently
+  keeps the extraEnv copy instead of the chart's real value, with no warning
+  (see **Fixed** below). An explicit value plus `n8n_prestop_sleep` must stay
+  strictly below `n8n_termination_grace_period`, or validation fails, because
+  Kubernetes would SIGKILL the pod before n8n finishes shutting down. Left
+  `null`, the module sends no override, the chart keeps its own 30s default,
+  and existing releases see no Helm values change. In that case the same rule
+  applied to the 30s default is only a warning, the new
+  `graceful_shutdown_fits_grace_period` check, so configurations that planned
+  before still plan. The warning is skipped for a custom
+  `n8n_chart_repository`, whose default the module cannot verify. See #147.
+
+### Changed
+
+- **Breaking: `aws_eks_node_group.n8n` is replaced on upgrade, and is now
+  create-before-destroy with a per-cluster name** (#198). The node group is
+  named from `node_group_name_prefix` (`<cluster_name>-nodes-<suffix>`)
+  instead of the fixed `n8n-nodes`, which every cluster this module creates
+  reused and which blocked creating a second group with that name in the same
+  cluster. A node group replacement (this upgrade, a `node_instance_type`
+  change, or toggling `node_launch_template_enabled`) now creates the new
+  group and waits for EKS to report it active before it deletes the old one,
+  instead of deleting it first. `update_config { max_unavailable = 1 }` is
+  now explicit, so a launch template version bump (from a new
+  `aws_partner_attribution_tag` or `node_disk_size`) drains at most one old
+  node at a time. **Upgrade note (breaking):** the first apply after
+  upgrading replaces the node group, because attaching the launch template
+  and the new name both force replacement; setting
+  `node_launch_template_enabled = false` does not avoid it. It needs EC2
+  quota and subnet IPs for both groups at once. Pods on the old nodes are
+  evicted, and EKS does not guarantee it waits for PodDisruptionBudgets, so
+  single-replica pods and running executions can be interrupted. Measured
+  live on `examples/small`: no full outage, about 2.5 minutes with fewer n8n
+  pods running and one failed request, against about 10 minutes of
+  disruption (4 to 5 fully down) for the same replacement without
+  create-before-destroy. That measurement predates the webhook processor and
+  worker PodDisruptionBudgets added in this release (see **Added**); without
+  them, both could stop together for about a minute. Run the upgrade in a
+  low-traffic maintenance window. Anything that selects nodes by
+  the old name, such as a `nodeSelector` on
+  `eks.amazonaws.com/nodegroup: n8n-nodes`, stops matching, and the new name
+  changes on every replacement, so do not pin to it. Downgrading to an earlier
+  module version replaces the node group again with the old delete-first
+  behavior: measured live, about 9.5 minutes of disruption, about 4.5 of them
+  fully down. See README.md → AWS Partner Revenue Measurement tag.
+- **Breaking: turning `eks_secrets_encryption_enabled` from `true` to `false`
+  on an existing cluster now fails at apply** with a cluster name conflict,
+  instead of replacing the cluster and everything on it. The AWS provider
+  treats removing `encryption_config` as a cluster replacement, because EKS
+  cannot turn envelope encryption off. The node group's create-before-destroy
+  carries over to the cluster, so Terraform would create the replacement
+  first, under the same fixed name. An unencrypted cluster means a new cluster
+  under a different `cluster_name` and migrating workloads to it; see
+  docs/build-time-decisions.md.
+- `tests/scripts/check-version-drift.sh` now classifies each pin `DRIFT`,
+  `OK`, or `ERROR` and closes with a one-line summary count of pins behind
+  upstream and errors (ported from the
+  sibling terraform-google-n8n module's drift script,
+  n8n-io/terraform-google-n8n#36). Terraform provider constraints are
+  compared against the constraint itself rather than printed as a bare
+  "constraint vs latest" pair: a `~> N[.N[.N]]` constraint that already
+  admits the latest release (e.g. this module's own `~> 6.0` on the `aws`
+  provider) now reports `OK` instead of looking like drift; a constraint
+  form the script cannot evaluate, or a latest provider release that is not
+  a plain `X.Y.Z` version, reports an explicit `ERROR` asking for a manual
+  compare instead of silently passing as current. Upstream lookup
+  failures are now explicit `ERROR` lines, never silently read as "up to
+  date", with one exception that predates this change: if the optional
+  lookup of the latest checkov release behind the #158 hold fails, the line
+  stays under "Known and expected" and that run skips the early warning that
+  a newer checkov release allows the next minor. The n8n chart check now reads its own
+  `oci://ghcr.io/n8n-io/n8n-helm-chart` registry's anonymous tag list
+  (filtered to plain `X.Y.Z` release tags, and an `ERROR` if the list comes
+  back paginated, since a truncated list could hide the newest release)
+  instead of
+  `n8n-io/n8n-hosting`'s latest Git tag: the script's own header and
+  docs/versioning.md previously claimed the OCI registry had "no equivalent
+  public index", which was wrong, and a Git tag can exist before the chart
+  is actually published to GHCR. The script still exits 0 when a lookup
+  fails (it exits 1 only when `curl`, `jq` or `python3` is missing), by deliberate
+  choice: `.github/workflows/version-drift.yml`'s only consumer
+  of this output is an unguarded step with no `if: always()` that syncs it
+  to a tracking issue, and a non-zero exit would make a lookup failure skip
+  that sync instead of surfacing in it. The existing `eks/kubernetes_version`
+  "Known and expected" section for #158 is unchanged in content; see #150.
+
+- `tests/scripts/check-version-drift.sh`'s provider-constraint evaluator now
+  understands any comma-separated combination of `~>`, `>=`, `>`, `<=`, `<`,
+  `!=`, `=`, or a bare version over numeric `N[.N[.N]]` versions, not only a
+  single `~> N[.N[.N]]` range: a constraint like `>= 1.2, < 3.0` is now
+  evaluated against the latest release instead of reported as an explicit
+  `ERROR`. The evaluator the drift-classification rework above wrote inline
+  in `check-version-drift.sh` is replaced by the new
+  `tests/scripts/lib/constraints.sh`, shared with the new offline unit test
+  `tests/scripts/test-version-drift-constraints.sh`, which runs on every pull
+  request as the `drift-constraints` CI job (ported from the sibling
+  terraform-google-n8n module, n8n-io/terraform-google-n8n#40). A constraint
+  or a latest release it cannot parse, such as a prerelease version, reports
+  `ERROR`, never `OK` or `DRIFT`. Terraform's rule that an exact constraint cannot be combined with another
+  is not enforced, since Terraform validates `versions.tf` itself. The script
+  now also requires `python3` up front, like `curl` and `jq`. This module's own
+  five provider constraints are all a single `~>` range today, so the drift
+  report's output is unchanged for them.
+
+- **`cluster_name` is now checked at plan time against S3's bucket-name
+  rules while the module creates the bucket**
+  ([#194](https://github.com/n8n-io/terraform-aws-n8n/issues/194)). The name is
+  embedded in the bucket name `n8n-<cluster_name>-<id>`, which S3 accepts only
+  with lowercase letters, digits, hyphens and periods, and a period may not
+  sit next to another period or a hyphen, nor at either end of the name.
+  `create-bucket` rejects an uppercase letter, an underscore and each of those
+  period placements with `InvalidBucketName`, but the AWS provider does not
+  validate bucket names at plan time and the name was validated for length
+  only, so such a name failed during `apply`. On the default configuration the
+  provider already rejected most of them at plan time through the identifiers
+  it does validate: the RDS instance identifier, the RDS subnet group name
+  (lowercase only) and the ElastiCache cluster ID. The outcome therefore
+  changes only when the database and Redis are caller-supplied
+  (`create_database = false` and `create_elasticache = false`); with either one
+  module-created, such a name was already rejected at plan time. The check is
+  skipped when `create_s3_bucket = false`, so a caller who brings their own
+  bucket keeps every name that works today. **Upgrade note:** a name that now
+  fails used to pass `plan` and then fail during `apply`, because S3 rejected
+  the bucket name. It now fails during `plan`, so no deployment that applied
+  successfully is affected.
+
+- **Breaking: the minimum Terraform version is now `>= 1.13`** (was
+  `>= 1.11`) in all thirteen `required_version` declarations: the module
+  root, `modules/controllers`, and all eleven examples. Two Terraform
+  releases set it: 1.12 and 1.13. Several validations and `check` blocks guard an expression with `||` or `&&`, which only
+  short-circuit from Terraform 1.12 (hashicorp/terraform#36224). On 1.11
+  both sides are evaluated, so a guarded expression could abort the plan
+  with an evaluation error instead of passing or failing cleanly. This hit
+  `db_max_allocated_storage` while it was in review (#167) and the
+  `n8n_dns_config` `ndots` validation (#175); CI ran only Terraform 1.16.4,
+  so neither failed there. Terraform 1.13 is needed on top of that for the
+  floor to be testable: `terraform test` on 1.12.x and older leaves about
+  one provider process running per run block, so the 806-run
+  `tests/defaults.tftest.hcl` exhausts a 16 GB CI runner (measured: 199
+  provider processes and 14 GB after ~185 runs on 1.12.0, while 1.13.0 stays
+  at 5). The leak is specific to `terraform test`, not to the module code,
+  but the new floor makes `init` reject 1.12 as well. CI now also runs every
+  `terraform test` suite on Terraform `1.13.0` in a new `test-floor` job, and
+  `tests/scripts/check-terraform-floor.sh` (`task terraform-floor`) fails it
+  if `TF_FLOOR_VERSION` and the declared floor disagree (#177).
+
+  **Upgrade note.** Under
+  [Stability & versioning](./README.md#stability--versioning), a raised
+  version floor is a minor-version boundary. No inputs, outputs, resources
+  or state change. Upgrade the Terraform CLI to 1.13 or newer wherever you
+  run this module: locally, in CI, and in any runner or workspace pin
+  (HCP Terraform, Atlantis and similar). Also widen any `required_version`
+  in your own configuration that excludes 1.13, such as `~> 1.12.0`. This
+  includes direct callers of `modules/controllers`. On 1.12 or older, `terraform init`
+  stops with an unsupported Terraform Core version error before planning
+  anything, so nothing is half-applied. To stay on Terraform 1.11 or 1.12,
+  pin this module to `~> 0.5.0`. On Terraform 1.11, 0.5.x still has #175: an
+  `n8n_dns_config` option without a `value` (for example `edns0`) aborts the
+  plan with "argument must not be null". Avoid value-less options there, or
+  upgrade Terraform.
+
+- Default `keda_chart_version` `2.20.2` to `2.21.0` (root module and
+  `modules/controllers`). Callers that do not pin `keda_chart_version` move
+  too: their next apply runs an in-place `helm upgrade` of KEDA. KEDA is
+  cluster-wide, so on `create_eks = false` the upgrade also affects every
+  other `ScaledObject` and `ScaledJob` in the cluster. KEDA 2.21 fixes
+  CVE-2026-77524 and carries three breaking changes: explicit service
+  account token audiences (Vault Kubernetes authentication and any
+  `TriggerAuthentication` using `boundServiceAccountToken`), removal of the
+  Temporal scaler's deprecated settings, and `scaleOnInFlight: true` as the
+  Azure Pipelines scaler default. The n8n chart's worker `ScaledObject` uses
+  none of these, but other workloads on a shared cluster may; read
+  <https://keda.sh/docs/2.21/migration/> before upgrading. KEDA's tested
+  Kubernetes window moves from `1.33` to `1.35` (2.20) to `1.34` to `1.36`
+  (2.21), so the module default `1.35` stays inside both. The chart itself
+  does not block other versions (`kubeVersion: >=1.23`), so this is a tested
+  range, not an enforced one. `kubernetes_version` accepts any
+  `major.minor`; for a cluster outside the new window, pin a release KEDA
+  tests there: `"2.20.2"` on `1.33`, `"2.19.0"` on `1.32`, `"2.18.3"` on
+  `1.31`. Treat that pin as a temporary compatibility hold, reviewed for
+  security: as of 2.21.0, KEDA has published no 2.20.x or older chart with
+  the CVE-2026-77524 fix. `1.30` and older are outside every window listed
+  here. On a cluster that already runs its own KEDA, `install_keda = false`
+  is the alternative; on a stack where this module already installed KEDA,
+  switching it off uninstalls that release (see `install_keda`). See #150.
+- `tests/scripts/check-version-drift.sh` moves `kubernetes_version` out of
+  the drift list into a "Known and expected" section linking open issue #158
+  while the pinned checkov's `CKV_AWS_339` does not allow the next EKS minor.
+  It returns to drift plus `ACTIONABLE` when the pinned checkov allows that
+  minor, when a newer checkov release allows it (bump `CHECKOV_VERSION`), or
+  when the pinned version is past the end of EKS standard support. An
+  unreadable or unparseable EKS release list, `isEol` flag, or pinned
+  allow-list keeps the line in the drift list with a note. See #150 and
+  #158.
+- Default n8n chart `1.13.0` to `1.14.0`.
+  - `n8n_image_tag = null` moves from `appVersion: 2.40.5` to `2.41.4`; pin
+    the running application version first if it is not already pinned. n8n
+    2.41.0 through 2.41.4 list no breaking changes.
+  - No changes to the chart's replica, KEDA or task-runner templates.
+    Worker-only task-runner capacity accounting now covers `1.14.0`.
+  - n8n-io/n8n-hosting#185: the chart stops rendering the deprecated
+    `N8N_AVAILABLE_BINARY_DATA_MODES`, and the module no longer sends
+    `s3.storage.availableModes` to chart `1.14.0` or newer, so n8n's
+    deprecation warning on every start is gone. A pinned chart older than
+    `1.14.0` still gets `"filesystem,s3"`: its own default is `"filesystem"`,
+    which n8n 1.x still reads. `n8n_extra_env`, `n8n_worker_extra_env` and
+    `n8n_worker_pools[*].extra_env` now reject it at plan time
+    (`local.n8n_deprecated_env_names`), and `tests/scripts/check-main-chart.sh`
+    fails if it is ever rendered. **A caller that sets it through one of those
+    inputs gets a plan-time error until the entry is removed.**
+  - n8n-io/n8n-hosting#184 (missing from the upstream release notes): the
+    chart's ConfigMap emits `N8N_WEBHOOK_URL` instead of `WEBHOOK_URL`. No
+    effect here: the chart only emits it from its own `webhook.url` or
+    Ingress, and the module sets neither. The module itself now stops setting
+    the deprecated `WEBHOOK_URL`, which also warned on every start, and
+    `N8N_WEBHOOK_URL` carries the same value. Every n8n pod rolls once on
+    apply because the env list changes. n8n `2.30.0` is the first release
+    that reads `N8N_WEBHOOK_URL`. Without `WEBHOOK_URL`, older releases fall
+    back to `http://<n8n_domain>:5678/`, so the module keeps sending it
+    unless the tags prove the image is current: a versioned
+    `n8n_image_tag` (or, for a custom image whose tag is not a version and
+    with task runners enabled, `n8n_task_runner_image_tag`) of `2.30.0` or
+    newer, or a null tag on the default chart repository at chart `1.12.0`
+    or newer. A tag only counts as versioned with a full numeric
+    `MAJOR.MINOR.PATCH` prefix, optionally preceded by a lowercase `v`, so
+    a custom tag such as `2.30.mypackages` proves nothing (#173). Floating tags (`stable`, `latest`), a private chart mirror
+    with a null tag, and a custom image whose tags carry no version still
+    get `WEBHOOK_URL` and its warning. Pinning a tag of `2.30.0` or newer
+    removes it; an older image keeps `WEBHOOK_URL` because it needs it. `WEBHOOK_URL` moves onto
+    the same deprecated-names list, so the three env inputs reject it with
+    the deprecation error instead of the module-managed one. The unread
+    `WEBHOOK_URL` key is dropped from `kubernetes_secret.n8n` (an in-place
+    Secret update on apply).
+  - n8n-io/n8n-hosting#209: chart validation reports every failure in one
+    render.
+  - See `docs/upgrading-n8n.md#moving-from-chart-1130-to-1140`.
+- Default n8n chart `1.14.0` to `1.15.0`.
+  - `n8n_image_tag = null` moves from `appVersion: 2.41.4` to `2.42.4`; pin
+    the running application version first if it is not already pinned. The
+    n8n 2.42.0 through 2.42.4 release notes contain no breaking-change
+    entries (a text search of the release notes, not a behavior audit).
+    **Unpinned callers move too:** with a null tag, the next apply upgrades
+    the application. Every n8n pod rolls once on this bump even with the image
+    pinned, because the chart's `helm.sh/chart` and `app.kubernetes.io/version`
+    labels and its `checksum/config` annotation change (with the tag pinned,
+    the rendered pod templates differ only in those three fields). Observed on a
+    live `examples/small` upgrade from `1.14.0` with a null tag: the plan was
+    0 to add, 2 to change, 0 to destroy (the n8n and LBC Helm releases), all
+    five pods were replaced within about two minutes, and the smoke test
+    passed afterwards.
+  - n8n-io/n8n-hosting#175: the chart now renders `database.ssl.enabled` as
+    `DB_POSTGRESDB_SSL_ENABLED`, the name n8n reads. Earlier charts rendered
+    `DB_POSTGRESDB_SSL`, which n8n ignores. The module sends
+    `database.ssl.*` only while `db_postgresdb_ssl_ca_pem` is delivered, and
+    until now always set `DB_POSTGRESDB_SSL_ENABLED` itself through
+    `config.extraEnv`. With a CA delivered on the upstream chart at a numbered `1.15.0` or newer
+    the module now omits its own entry
+    (`local.n8n_chart_renders_postgres_ssl_enabled`), because the chart
+    supplies it and every container would otherwise carry the name twice.
+    With no CA, with `db_postgresdb_ssl_enabled = false`, on an older chart,
+    on a prerelease chart (including the worker-pools preview), or on a
+    custom `n8n_chart_repository` (whose contents the module cannot verify)
+    the module's entry stays. The
+    CA-delivered, no-CA and older-chart cases were checked on a live cluster;
+    the SSL-off and custom-repository cases are covered by `terraform test`
+    only. `tests/scripts/check-main-chart.sh` now fails if a container
+    carries `DB_POSTGRESDB_SSL_ENABLED` other than exactly once, with and
+    without a
+    CA. The chart's upgrade note that `database.ssl.enabled: true` now
+    actually negotiates TLS does not change anything here: the module never
+    sets `database.ssl.enabled` without also setting `database.ssl.ca`,
+    which the note says is unaffected.
+  - New chart keys `extraObjects` and `database.ssl.existingSecret` are not
+    exposed by this module (`docs/helm-chart-coverage.md`).
+  - No changes to the chart's `deployment-*.yaml` templates, so main pods
+    still have no task-runner sidecar in queue mode. Worker-only task-runner
+    capacity accounting now covers `1.15.0`.
+  - See `docs/upgrading-n8n.md#moving-from-chart-1140-to-1150`.
+- Default n8n chart `1.15.0` to `1.16.0`.
+  - `n8n_image_tag = null` moves from `appVersion: 2.42.4` to `2.43.5`; pin
+    the running application version first if it is not already pinned.
+    **Unpinned callers move too:** with a null tag, the next apply upgrades
+    n8n across its database migrations. The module sends the same Helm
+    values on both charts; only what the chart itself renders differs.
+  - n8n-io/n8n-hosting#228: the chart renders the main `PodDisruptionBudget`
+    only while main can run more than one replica, so single-main
+    (`n8n_main_hpa_min_replicas = 1`) loses the `minAvailable: 0` budget
+    this module still sends; multi-main keeps `minAvailable: 1`. Eviction
+    permissions are unchanged (that budget already permitted every
+    voluntary eviction), but Helm deletes the `n8n-main` PDB object on
+    the upgrade, and `smoke-test.sh` was adjusted for that.
+    `tests/scripts/check-main-chart.sh` renders both
+    topologies and expects no single-main PDB from `1.16.0`;
+    `tests/scripts/smoke-test.sh` now accepts no PDB or `minAvailable: 0`
+    for single-main (it failed on a missing PDB before), tells a missing
+    PDB apart from a failed lookup, and still requires `minAvailable: 1`
+    for multi-main.
+  - n8n-io/n8n-hosting#223: the worker task-runner sidecar gains a liveness
+    probe on the launcher's `/healthz`, port 5680. The module sets nothing
+    that moves that port; `tests/scripts/check-main-chart.sh` asserts the
+    probe.
+  - n8n-io/n8n-hosting#229: more than one main now requires
+    `multiMain.enabled` and `license.enabled` at render time. Every
+    configuration this module accepts already satisfies both.
+  - The task-runner sidecar moved into a shared `n8n.taskRunnerContainer`
+    template helper with the same placement and resources, so `1.16.0`
+    joins the worker-only task-runner capacity accounting alongside
+    `1.12.0`, `1.13.0`, `1.14.0`, and `1.15.0`.
+  - New chart keys `editor.url`, `hostAliases`, image digests,
+    `persistence.annotations`, per-role `podSecurityContext` and
+    `containerSecurityContext`, and `secretRefs.env.N8N_ENCRYPTION_KEY_FILE`
+    are not exposed. The module keeps rendering its own
+    `N8N_EDITOR_BASE_URL`.
+  - See `docs/upgrading-n8n.md#moving-from-chart-1150-to-1160`.
+  - Re-verified live on `1.16.0` after an in-place upgrade (`examples/small`,
+    multi-main): `terraform plan` showed exactly one change,
+    `helm_release.n8n`'s `version`, with byte-identical Helm values; the
+    apply completed in just over two minutes with main, worker, and
+    webhook-processor pod counts never dropping below their floors, zero
+    restarts, and a clean `-detailed-exitcode` re-plan afterward. The
+    upgraded release ran n8n `2.43.5` with the worker task-runner's new
+    `/healthz:5680` liveness probe, and `tests/scripts/smoke-test.sh` passed
+    (26/0/2/3). Re-ran with `n8n_main_hpa_min_replicas = 1`: no `n8n-main`
+    `PodDisruptionBudget` was created, confirming n8n-io/n8n-hosting#228 above, and
+    smoke-test passed again (28/0/2/3) with its new no-PDB assertion for
+    this topology.
+- Default `lbc_chart_version` `3.5.0` to `3.6.0` (root module and
+  `modules/controllers`; the AWS Load Balancer Controller moves from `v3.5.0`
+  to `v3.6.0`). The chart's `templates/` are identical between the two
+  versions, including the `webhookConfig.ingressValdationFailurePolicy`
+  spelling the module's override depends on. **Unpinned callers move too:**
+  the next apply upgrades the controller in place.
+  - Helm does not upgrade the CRDs in a chart's `crds/` directory, so an
+    existing cluster keeps the CRDs it already has. `3.6.0` adds one optional
+    field to `TargetGroupBinding` (`registerTargetsWithPodAvailabilityZone`,
+    cross-account IP targets) and changes a description in the Gateway API
+    CRDs. This module uses neither, and an upgraded cluster ran correctly on
+    the older CRDs. Upstream's release notes recommend applying the new CRDs
+    (`kubectl apply -k "github.com/aws/eks-charts/stable/aws-load-balancer-controller/crds?ref=master"`)
+    if you use the new field; a fresh install gets them from the chart.
+  - Re-verified live on `3.6.0` after an in-place upgrade: the ALB and both
+    target groups stay healthy, the `alb_inbound_cidrs` rule on the ALB
+    security group is unchanged, and the module's `failurePolicy` overrides
+    are intact. The other ALB behaviors documented here (IngressClassParams
+    precedence, prefix-list quota, `security-groups` annotation) were
+    measured on `3.5.0` and were not re-measured on `3.6.0`.
+- **`n8n_webhook_hpa_max_replicas` default drops from `8` to `4`, and
+  `db_postgresdb_pool_size` default drops from `10` to `9`.** The previous
+  defaults asked for more connections than the default database can offer.
+  A live `db.t3.small` running PostgreSQL 18.6 reports `max_connections` of
+  191, of which 184 are usable by n8n once the superuser and RDS-internal
+  reserves are subtracted. Main (6) + worker (10) + webhook (8) = 24 pods ×
+  pool size 10 requested 240 connections. At the new defaults, 20 pods ×
+  pool size 9 request 180, so the new
+  `check.db_postgresdb_pool_size_fits_known_max_connections` (see **Added**
+  above) stays silent at the module defaults. The margin is small (4
+  connections) and assumes every pod fills its pool at once.
+  Upgrade notes:
+  - An explicit `n8n_webhook_hpa_max_replicas` or
+    `db_postgresdb_pool_size` is untouched. To keep the old values, set
+    `n8n_webhook_hpa_max_replicas = 8` and `db_postgresdb_pool_size = 10`
+    explicitly, and raise `db_instance_class` to keep the database sized
+    for them; the check warns otherwise.
+  - **A caller who sets `n8n_webhook_hpa_min_replicas` above 4 without
+    setting `n8n_webhook_hpa_max_replicas` now fails at plan** with
+    "n8n_webhook_hpa_min_replicas must not exceed
+    n8n_webhook_hpa_max_replicas". Set `n8n_webhook_hpa_max_replicas`
+    explicitly to a value at or above the minimum.
+  - If you rely on the default module-managed webhook HPA maximum, applying
+    this upgrade lowers `maxReplicas` to 4, and the HPA controller can then
+    reduce existing replicas above 4. Set an explicit maximum before
+    upgrading to keep that capacity.
+  - If you rely on the default pool size, the next apply changes
+    `DB_POSTGRESDB_POOL_SIZE` from 10 to 9, so every n8n pod (main, worker,
+    webhook processor) restarts once.
+  - `examples/worker-pools` now sets `db_instance_class = "db.t3.medium"`:
+    its three pools add 10 pods, taking its peak to 270 connections, above
+    the `db.t3.small` budget. For an existing deployment of that example,
+    the next apply requests an in-place instance class change. With the
+    default `db_apply_immediately = false`, AWS schedules it for the next
+    maintenance window; the resize interrupts database availability.
+- Default n8n chart `1.12.0` to `1.13.0`. `n8n_image_tag = null` still uses
+  the selected chart's default, which moves from `appVersion: 2.39.6` to
+  `2.40.5`; pin the running application version first if it is not already
+  pinned, to avoid an unintended downgrade. **The first upgrade can
+  interrupt running worker pods.** Upstream stops setting a worker
+  Deployment's `replicas` once an autoscaler owns the count
+  (n8n-io/n8n-hosting#201), which this module meets whenever
+  `n8n_worker_keda_min_replicas` is 1 or more. On the first `helm upgrade`,
+  Helm removes the field and Kubernetes defaults it to 1, whatever the
+  configured floor. For a deployment running more than 1 worker (for
+  example `examples/medium` at a floor of 5, `examples/large` at 20),
+  surplus pods start terminating, and executions still running when a
+  pod's shutdown window ends (30 seconds by default) can be interrupted.
+  On a healthy installation, KEDA's HPA is expected to restore the floor.
+  This case was not tested live; the live validation ran at a floor of 1.
+  Upgrade in a low-traffic window and let running work drain first;
+  raising the floor beforehand does not help. No input changes.
+  Webhook processors are unaffected: their autoscaling is the module's own
+  Terraform-managed HPA in `scaling.tf`, outside the chart's KEDA/HPA model.
+  The capacity model's worker-only-runner accounting now covers both
+  `1.12.0` and `1.13.0`. The new `keda.webhookProcessor` pause/scale-to-zero
+  values are not exposed by this module. See
+  `docs/upgrading-n8n.md#moving-from-chart-1120-to-1130`.
+- Default n8n chart `1.11.0` to `1.12.0`. This requires a minor module
+  release: callers without an explicit chart pin receive a Helm upgrade and
+  pod rollouts. `n8n_image_tag = null` still uses the selected chart's default,
+  but that changes from floating `stable` to `appVersion: 2.39.6`. **Inspect
+  and pin the running application version before upgrading the chart** to
+  avoid a downgrade, such as `2.40.5` back to `2.39.6`. See
+  `docs/upgrading-n8n.md`; Helm rollback cannot reverse database migrations.
+  In queue mode, runners now run only on workers. The capacity estimate
+  removes main-runner CPU for verified upstream `1.12.0` (including build
+  metadata), reducing default peak requests from `16,600m` to `15,400m`.
+  Older, preview, future unverified, and custom charts keep conservative
+  accounting. No autoscaler ceilings change; worker-pool guards remain in
+  place. The chart's KEDA worker pause settings shipped in this same
+  release; the module supports them from chart `1.13.0` (see **Added**
+  above).
+- CI Terraform pin `1.16.2` to `1.16.4` and Checkov `3.3.17` to `3.3.20`.
+  The new `CKV_AWS_394`
+  findings (from Checkov `3.3.19`) have scoped exceptions on all eleven
+  examples' dynamic Availability Zone lookups to preserve their
+  region-portable behavior. Zone identities can still change between
+  plans; pin them in long-lived VPC configurations before applying. No
+  checks are suppressed repo-wide. Checkov `3.3.20` adds no new checks.
+  Its only change is a plan-parser fix for `forget`-action resources.
+  `CKV_AWS_339`'s allow-list still ends at `1.35`, which keeps
+  `kubernetes_version` at `1.35` per `docs/versioning.md`. See #139 and
+  #150.
+- CI Terraform pin `1.16.4` to `1.16.6`. Checkov stays at `3.3.20` rather
+  than moving to `3.3.28`: with `3.3.28`, the opt-in pass of
+  `tests/scripts/check-checkov.sh` fails `CKV_K8S_14`, `CKV_K8S_15` and
+  `CKV_K8S_43` on `kubernetes_deployment_v1.redis_exporter` although its
+  image is pinned by tag and digest, and the default pass is clean. The
+  checks' source is identical in both releases, so the difference is in how
+  Checkov resolves the resource, not in what the checks look for. Held
+  until that is understood. Tracked in #193; see also #150.
+- AWS provider locks `6.64.0` to `6.65.0` in the root, all eleven examples,
+  and `modules/controllers`, with checksums for Linux amd64, Linux arm64,
+  and macOS arm64. The `~> 6.0` constraint and all other provider selections
+  are unchanged. Published-module consumers retain their own provider
+  locks. These provider and toolchain updates do not change infrastructure
+  defaults. See #139.
+- The `terraform apply` quickstarts in the examples other than
+  `worker-pools` now pass `-compact-warnings`, reducing multi-line
+  "Deprecated Resource" warnings on `kubernetes_namespace` and
+  `kubernetes_secret` (tracked in #138) to summaries. This also hides the
+  details of other warnings: rerun without the flag to read them.
+  `examples/worker-pools` and `docs/upgrading-n8n.md` keep full warnings
+  visible because their plan and apply instructions require them. See the
+  "Verification-required" tier in `docs/versioning.md` for why the
+  underlying rename is blocked on upstream
+  `hashicorp/terraform-provider-kubernetes#2812`.
+- CI Helm CLI pin (the `azure/setup-helm` `version` input) `v4.3.0` to
+  `v4.3.1` in the `chart` and `chart-coverage` jobs. Patch release: a
+  CRD-establishment wait under `HookOnlyStrategy` and a linter bump. See
+  #150. `tests/scripts/check-version-drift.sh` now reads every
+  `setup-helm` `version` input and reports an `ERROR` when they disagree,
+  instead of reading only the first.
+
+### Removed
+
+- The single-instance code path from `tests/scripts/smoke-test.sh` (the
+  SQLite PVC check, task runner sidecar and Python runner checks on
+  `n8n-main`, and the JS + Python execution workflow), the `DEPLOY_MODE`
+  variable, and every mode branch. This module always deploys queue mode
+  (`queueMode.enabled = true`, RDS or customer-managed PostgreSQL), so the
+  branch tested a topology the module never creates. Worse, a broken
+  deployment missing its `n8n-worker` Deployment was silently tested as
+  that other topology instead of failing. The script now has one code
+  path and fails when `n8n-worker` is absent. See #151.
+
+### Fixed
+
+- **The module-managed S3 bucket could be destroyed and recreated by an
+  unrelated change in the caller.** The bucket name embeds
+  `data.aws_caller_identity.current.account_id`. A caller that sets
+  `depends_on` on the module call, as every example does with the VPC, has
+  that data source deferred to apply whenever the dependency has a pending
+  change (for example a tag edit on the VPC). The name then planned as
+  "known after apply" and forced a replacement of `aws_s3_bucket.n8n`,
+  `aws_s3_bucket_public_access_block.n8n`,
+  `aws_s3_bucket_server_side_encryption_configuration.n8n` and
+  `aws_kms_alias.s3`; with the default `s3_force_destroy = true` that deletes
+  the binary data in the bucket. `aws_s3_bucket.n8n` now ignores changes to
+  `bucket` and `aws_kms_alias.s3` to `name_prefix`. A change to `cluster_name`
+  still replaces the bucket, as before: `replace_triggered_by` on
+  `aws_iam_role.s3.name`, which is derived from `cluster_name` alone, keeps
+  that rename working. The n8n Helm values and the `s3_bucket_name` output
+  now read the name from `aws_s3_bucket.n8n` rather than recomputing it, so
+  they follow the name of the bucket Terraform manages. Reproduced and fixed against real
+  AWS: a change to the module's `depends_on` target and an in-place tag update
+  on the role replace nothing, and a `cluster_name` change replaces the bucket.
+
+- `check.autoscaling_maxima_fit_node_group_capacity` (`scaling.tf`) models the
+  same worker ceiling as the connection-budget check: while
+  `n8n_worker_keda_pause = true`, the worker term uses
+  `n8n_worker_keda_paused_replica_count` when that is larger than
+  `n8n_worker_keda_max_replicas`, so paused workers that do not fit the node
+  group are no longer missed
+  ([#186](https://github.com/n8n-io/terraform-aws-n8n/issues/186)). The shared
+  `local.n8n_worker_modeled_max_replicas` moved from `database.tf` to
+  `scaling.tf`. Advisory only: plan and apply are unaffected.
+
+- **Controller Helm releases install one at a time** (#174). In
+  `modules/controllers`, the Cluster Autoscaler, metrics-server, the AWS
+  Load Balancer Controller, and KEDA used to install in parallel (only KEDA
+  waited for the Load Balancer Controller). On a fresh cluster, one release
+  failed on a transient API timeout, the others still installing were
+  cancelled (cause not confirmed), and a cancelled release was left in
+  Helm's `pending-install` state, which blocks the next apply until it is
+  removed by hand. They now install in that order, and each release depends
+  on every earlier one, so the order holds for any combination of
+  `install_*` toggles. When one release fails, Terraform skips the later
+  ones, so none of them is in flight when the run stops. No inputs,
+  defaults, or resource addresses change, and existing releases see no
+  resource changes. The first apply and a full destroy take longer: a
+  fresh apply takes about the sum of the four install times, and a full
+  destroy about the sum of the four uninstall times, rather than the
+  longest one. The same
+  order applies to any apply that changes several controller releases at
+  once, such as chart version bumps, and a targeted destroy of one
+  controller release now also selects every release after it. Direct callers of
+  `modules/controllers` get the same order.
+  [`docs/troubleshooting.md`](./docs/troubleshooting.md) has a new entry for
+  finding and removing a stranded `pending-install` release.
+- **`n8n_image_repository` applies Docker's 255-character limit to the
+  repository path, not the whole string.** Docker measures the path after
+  normalizing the reference (`distribution/reference` v0.6.0): the registry
+  host does not count, and a single-component Docker Hub name counts an
+  implicit `library/` prefix. A path of up to 255 characters behind a
+  registry host is now accepted, and a bare name of 248 to 255 characters,
+  which Docker could never pull, is now rejected at plan time. The limit is a
+  validation of its own with its own message, and the reference pattern now
+  lives in `local.image_repository_regex`, shared with
+  `n8n_task_runner_image_repository`. The examples' copies follow the same
+  rule.
+- **`keda_chart_version = null` now resolves to the module default.** The
+  root input declares `nullable = false`, matching `modules/controllers`. An
+  explicit `null`, for example from a caller's own nullable pass-through
+  variable, previously failed the input's SemVer validation with a
+  misleading "must be an exact SemVer 2 version" error.
+- **`tests/scripts/smoke-test.sh` reports a missing Ingress route instead of
+  exiting silently** (#156). Under `set -euo pipefail`, the no-match `grep` in
+  the Ingress routing lookups aborted the script before the "is not routed"
+  FAIL or the missing catch-all `/` WARN could print, skipping the summary and
+  every later check. Both lookups now tolerate no match with `|| true`.
+
+- **`tests/scripts/check-checkov.sh` applies the opt-in tfvars from any
+  shell.** On checkov 3.3.20, a single exported `TF_VAR_*`, even one the
+  module has no input for, makes checkov ignore `--var-file`. Pass 2 then
+  reported pass 1's counts and failed with "pass 2 did not reach
+  `kubernetes_deployment_v1.redis_exporter[0]`", which pointed at a missing
+  toggle or a renamed resource rather than the environment. The script now
+  unsets every `TF_VAR_*` before scanning. CI exports none, so its results
+  do not change.
+
+- **`tests/scripts/smoke-test.sh` no longer passes on a broken deployment**
+  (#154). A not-Ready worker `ScaledObject` fails at any floor; an execution
+  still `new` or `waiting` when polls run out, or whose status the API never
+  returned, fails instead of warning (an empty execution list still warns,
+  since `n8n_executions_data_save_on_success = "none"` deletes successful
+  runs);
+  `python3` is now checked at preflight; the runner check counts only `task offer` or `[runner:js|py]`
+  lines, not "Waiting for task broker";
+  the leader check scans every main pod's logs for `Leader is now this
+  instance` and warns (does not fail) when none has it; a missing or
+  unreadable `n8n-worker` is reported once instead of three times, and the
+  checks that need a worker, including the queue workflow, skip; the queue
+  workflow now runs a JS Code node when the runner sidecar exists and a
+  Python Code node when `taskRunners.nativePythonRunner` is set (needs
+  `helm`; an info line says when Python is not exercised).
+
+- `n8n_extra_env` and `n8n_worker_extra_env` now reject
+  `N8N_GRACEFUL_SHUTDOWN_TIMEOUT` at plan time. Chart `1.13.0` renders that
+  ConfigMap key unconditionally on every n8n container from
+  `redis.worker.timeout`, and `extraEnv` is appended after it in every
+  deployment template, so a caller-supplied duplicate previously passed
+  `terraform plan` with no error at all: Kubernetes does not reject
+  duplicate env names, it silently keeps the last entry in the list, so the
+  caller's raw value would replace the chart's real one with no plan- or
+  apply-time warning. The same guard already existed for
+  `n8n_queue_worker_lock_duration` and its siblings; this closes the gap for
+  the graceful shutdown timeout. `n8n_worker_pools[*].extra_env` rejects the
+  name too, through the same reserved list. **Breaking for callers who set
+  this name through any of these inputs:** their `terraform plan` now fails.
+  Remove the `extra_env` entry and set `n8n_graceful_shutdown_timeout` (a
+  number of seconds) instead. Two differences to check first: the input
+  applies to every n8n container, so a value that was set only on workers
+  (`n8n_worker_extra_env`) or only on one pool now also reaches mains and
+  webhook processors, and different values per pool can no longer be kept;
+  and the value plus `n8n_prestop_sleep` must stay below
+  `n8n_termination_grace_period`, which the old `extra_env` route never
+  checked. See #147.
+
+- `n8n_worker_keda_min_replicas = 0` no longer renders no worker Deployment
+  and no worker `ScaledObject`. `queueMode.workerReplicaCount` is now
+  floored at `max(1, n8n_worker_keda_min_replicas)`, decoupled from
+  `keda.worker.minReplicaCount`, which still gets the caller's real floor
+  including `0`. Previously a floor of `0` removed the default workers
+  entirely, since the chart gates both templates on `workerReplicaCount >
+  0`, leaving jobs on the default queue with no consumer and no autoscaler
+  to bring one up (#146). **Behavior change for callers already at a floor
+  of `0`:** the next apply creates a worker Deployment and a worker
+  `ScaledObject` where there were none. On chart `1.13.0` or newer the new
+  Deployment has no `spec.replicas`, so Kubernetes starts it at 1 replica.
+  That worker processes any backlog that built up on the default `jobs`
+  queue while it had no consumer, and KEDA then scales it to zero once the
+  queue stays empty for its cooldown period. On a chart older than `1.13.0`,
+  the chart still renders `spec.replicas: 1`, so every apply that updates
+  the Helm release can reset a Deployment KEDA scaled to zero back to 1
+  replica until KEDA reconciles it again. A floor of `0` can no longer be used to run without
+  default workers, for example beside `n8n_worker_pools`: the default
+  Deployment now always exists, and KEDA starts it whenever jobs arrive on
+  the default queue. Check that queue before you apply if old jobs in it
+  should not run. `tests/scripts/smoke-test.sh` now accepts workers scaled
+  to zero when the worker `ScaledObject` has a floor of `0` and is Ready. It
+  fails when the scaler is not Ready, warns when it is paused, skips the
+  in-pod Redis probe in that state, skips the test execution when the scaler
+  is paused or not Ready at zero, waits up to 180s for a worker that is
+  starting from zero during the pod health check (then warns only when every
+  worker pod is waiting for a node, and fails otherwise), and polls the test
+  execution 90 times instead of 30, 2s apart (about 180s instead of 60s), so
+  KEDA can start a worker. A Deployment whose replica counts cannot be read
+  now fails instead of reading as `0`. A missing
+  `n8n-worker` Deployment now fails too, instead of silently switching the
+  script to its single-instance checks: this module always runs queue mode
+  and always renders that Deployment, so its absence means a broken
+  deployment.
+  The unhealthy-pod listing in the pod health check now selects pods by
+  their `app.kubernetes.io/component` label (`main`, `worker`,
+  `webhook-processor`); it used the Deployment name before and never
+  matched any pod.
+
+## [0.5.0] - 2026-09-21
+
+Minor release per the [stability contract](./README.md#stability--versioning):
+the Kubernetes provider floor bump below is breaking for callers pinned to
+the previous major. Pin this module to `~> 0.4.0` to stay on Kubernetes
+provider 2.x, or read the upgrade note under **Changed** below and in
+`README.md`'s Compatibility section.
+
+**What moves on apply** for a caller who changes nothing but the module
+source pin. Every item below is a default-value bump, so a deployment that
+does not set the variable itself picks up the new default on its next
+`terraform apply`:
+
+- `n8n_chart_version` `1.10.0` → `1.11.0`: `helm_release.n8n` plans an
+  in-place `version` change and the apply runs `helm upgrade`, which rolls
+  every n8n main, worker, and webhook-processor pod. Chart `1.11.0`'s two
+  changes do not reach this module: the KEDA trigger `listName` default moved
+  from `bull:default:wait` to `bull:jobs:wait`, but this module sets
+  `listName` itself (already `<prefix>:jobs:wait`); and the chart's own
+  webhook Ingress gained a `/mcp/` rule, but this module disables the chart
+  Ingress and manages its own, which already routes `/mcp/`.
+- `metrics_server_chart_version` `3.13.1` → `3.14.0`: the metrics-server
+  release plans the same in-place `version` change and rolls metrics-server
+  in `kube-system`. **This raises metrics-server's Kubernetes floor**: chart
+  `3.14.0` ships metrics-server `0.9.x`, which supports Kubernetes `1.34+`;
+  `3.13.1` shipped `0.8.x`, supporting `1.31+`. The module default
+  (`kubernetes_version = "1.35"`) is fine. A caller on `1.31` through `1.33`,
+  including one bringing an older cluster via `create_eks = false`, must pin
+  `metrics_server_chart_version = "3.13.1"` or set
+  `install_metrics_server = false` before applying.
+- The new top-level `replicaCount` Helm value (see **Changed**) is a one-time
+  change to `helm_release.n8n`'s `values` input, so that release is updated
+  in-place even for a caller who pins `n8n_chart_version` at `1.10.0`. The
+  rendered replica count does not change.
+- `db_engine_version` `18.4` → `18.6`: **no plan diff** on an existing
+  instance. `aws_db_instance.n8n` ignores changes to `engine_version`
+  (`lifecycle.ignore_changes`) because `auto_minor_version_upgrade = true`
+  lets AWS own the running minor. Only a new database reads the new default,
+  plus the opt-in `db_query_logging_enabled` parameter group, whose `family`
+  is derived from the major and is unchanged at `postgres18`.
+
+Everything else below (provider majors, CI toolchain, the new `replicaCount`
+line) either needs no caller action or carries its own note under **Changed**.
+
+### Added
+
+- CI now runs `markdownlint` (pinned via `MARKDOWNLINT_VERSION`) against
+  `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, and `docs/*.md`. The generated
+  `<!-- BEGIN_TF_DOCS -->` block in `README.md` is wrapped in
+  `<!-- markdownlint-disable -->` / `<!-- markdownlint-restore -->` comments
+  placed outside the block to suppress false positives from terraform-docs
+  output (placeholder tokens, bare URLs) without hand-editing the generated
+  content itself.
+- `docs/versioning.md`: the full inventory of every version this module pins
+  (providers, the Terraform CLI floor, the n8n and controller charts,
+  `kubernetes_version`, the database engines, and the CI toolchain), which
+  file it lives in, and which of three bump tiers it falls into (patch-safe,
+  minor-required, verification-required). Referenced from `CONTRIBUTING.md`.
+- `tests/scripts/check-version-drift.sh` and a weekly
+  `.github/workflows/version-drift.yml` job: reports every pin reachable
+  from a public API (Terraform providers, the CI toolchain, the five Helm
+  charts this module installs, and `kubernetes_version` against EKS's
+  supported-version list via `endoflife.date`) that has fallen behind
+  upstream, and syncs the report to a single tracking issue. Reports only,
+  never auto-bumps or fails the build; see `docs/versioning.md` for the pins
+  (RDS/ElastiCache and Aurora engine versions) that still need a
+  credentialed, account-scoped `describe-*` call instead.
+- `tests/scripts/check-helm-chart-coverage.sh`, CI-gated as a new
+  `chart-coverage` job: fails the build when `docs/helm-chart-coverage.md`'s
+  declared chart version disagrees with `n8n_chart_version`'s default, or when
+  the pinned chart's `values.yaml` has a top-level key the doc never mentions.
+  Caught a real pre-existing gap on its first run: `nameOverride`,
+  `fullnameOverride`, and top-level `replicaCount` were never in the coverage
+  table at all.
+- `tests/scripts/chart-values-diff.sh` and a `task chart-diff CANDIDATE=<version>`
+  target: diffs the pinned n8n chart's `values.yaml` against a candidate
+  version via `helm show values`, so the manual diff step in the
+  version-currency pickup workflow is one command instead of two remembered
+  `helm show values` invocations. Never writes or bumps a pin. Exits 0 once
+  both `helm show values` calls succeed and `diff` ran, regardless of
+  whether a diff was found; exits 1 on bad usage, a missing tool, a failed
+  `helm show values` call (a network/registry issue, or a candidate version
+  that doesn't exist), or a `diff` error. The `read_default` awk helper the
+  version-drift and chart-coverage scripts each carried now lives once in
+  `tests/scripts/lib/tf-defaults.sh`, sourced by all three.
+- `docs/versioning.md` is now linked from `README.md`'s `Compatibility`
+  section (previously only from `CONTRIBUTING.md`/`AGENTS.md`, both
+  contributor-facing), and `docs/upgrading-n8n.md`'s opening paragraph now
+  points to it alongside `Stability & versioning`/`Compatibility`, so "how do
+  I upgrade anything" has one on-ramp regardless of which layer moved.
+- **`docs/istio-ingress.md`**: routing knowledge for callers running Istio
+  instead of an ALB Ingress Controller, replacing an earlier draft that
+  shipped as a full runnable `examples/istio-split-ingress` (own Istio
+  install, hand-authored routing chart, version pins, CI wiring). Covers the
+  `create_ingress = false` contract this module exposes either way, the same
+  no-catch-all-on-public / prefixes-before-catch-all-on-internal route rules
+  `examples/split-ingress` documents for the ALB case, expressed as
+  `Gateway`/`VirtualService` instead of `kubernetes_ingress_v1`, and the
+  "200 with an HTML body" webhook-misroute trap both share. Purely additive:
+  no new example, no CI matrix entry, no new module input or output. See
+  [#87](https://github.com/n8n-io/terraform-aws-n8n/issues/87).
+- **Deletion-time controls for the module-managed RDS instance and S3
+  bucket**: `db_deletion_protection` (default `false`),
+  `db_skip_final_snapshot` (default `true`), `db_final_snapshot_identifier`
+  (default `null`, required when `db_skip_final_snapshot = false`,
+  rejected when it is `true`, and validated against the RDS snapshot naming
+  rule at plan time), `db_delete_automated_backups` (default
+  `true`), and `s3_force_destroy` (default `true`). Every default matches
+  the value the module previously hardcoded, so existing deployments see no
+  plan diff; flip them for production per the new README section "Deletion
+  protection and teardown", which also covers why a retained snapshot or
+  bucket is unrecoverable once the module-managed KMS key finishes its
+  seven-day deletion window, and the `create_*_kms_key = false` path that
+  avoids it. Matching `rds_*` / `s3_force_destroy` outputs echo the values
+  in effect, and a new `s3_force_destroy_requires_module_managed_bucket`
+  check warns when `s3_force_destroy = false` is set alongside
+  `create_s3_bucket = false`, mirroring the RDS controls' clause in
+  `rds_tuning_requires_module_managed_database`. `examples/small` and `examples/medium` pass all five through,
+  along with the existing `db_backup_retention_period`, as nullable
+  example variables; the other examples' "Production considerations" tables
+  now name the inputs instead of telling readers to fork the module. See
+  [#134](https://github.com/n8n-io/terraform-aws-n8n/issues/134).
+- `scripts/check-example-parity.sh` (`task example-parity`, local-only for
+  now, not yet wired into CI): diffs the set of variable names every
+  example's `variables.tf` declares against `examples/small`'s and fails on
+  any name present on one side only that is not in its per-example allowlist (DNS-provider credentials, `customer_managed_*`
+  stand-in sizing plus `kubernetes_version` where the example builds its own
+  cluster, split-ingress's own Ingress knobs, large's Aurora and BYO
+  certificate inputs, `n8n_additional_domains` where an example cannot take
+  it, and the module-side deletion controls on a layer the example brings
+  itself). A stale allowlist entry fails too. Names only: a shared
+  variable's type or default is not compared. It also fails when an example
+  still lets the module create RDS or S3 but its README has no "Production
+  considerations" section. Added after both kinds of drift happened silently;
+  see #136.
+- The deletion-control pass-throughs #134 added to `examples/small` and
+  `examples/medium` (`db_backup_retention_period`, `db_deletion_protection`,
+  `db_skip_final_snapshot`, `db_final_snapshot_identifier`,
+  `db_delete_automated_backups`, `s3_force_destroy`) now reach every other
+  example that lets the module own the layer they control: all six on
+  `cloudflare`, `godaddy`, `split-ingress`, `customer-managed-redis` and
+  `customer-managed-cluster`; the five `db_*` on `customer-managed-s3`, whose
+  stand-in bucket already has `customer_managed_s3_force_destroy`; and
+  `s3_force_destroy` alone on `large`, whose Aurora cluster carries the
+  database-side equivalents in `aurora.tf`. `customer-managed-everything`
+  brings both RDS and S3 itself, so it takes none. Each is a nullable
+  variable defaulting to the module's value, so no plan diff. Every example's
+  `tests/defaults.tftest.hcl` asserts the wiring at defaults and with every
+  value flipped, except `customer-managed-cluster`, whose test file cannot
+  complete an ordinary plan under mocks (see its header); there `terraform
+  validate` proves the inputs are accepted and the note in that file says
+  why nothing more is possible. This is the first drift
+  `scripts/check-example-parity.sh` caught: on a checkout of #134 alone it
+  fails 48 times. The shared `db_final_snapshot_identifier` description in
+  all eight examples also now says the value must stay null when
+  `db_skip_final_snapshot` is true, matching the module's validation, rather
+  than "ignored otherwise". See #136.
+- `n8n_worker_pools` (**Early Alpha, subject to change without notice**): labelled
+  n8n worker pools, one per entry, each rendered by the chart's
+  `queueMode.workerGroups` as a worker Deployment carrying
+  `N8N_WORKER_POOL_NAME=<name>` plus a KEDA ScaledObject watching that pool's
+  own `jobs-<name>` queue. Per-pool replica bounds, concurrency, resources and
+  extra env, each falling back to the module-wide worker setting when null.
+  Declaring any pool also emits `N8N_WORKER_POOLS_ENABLED=true` on every pod.
+  Default `[]`, which omits `queueMode.workerGroups` from the Helm values
+  entirely rather than sending an empty list, so a deployment that declares no
+  pool sees no `helm_release` diff at all.
+  Pool names are validated at plan to the pattern n8n itself only warns
+  about, capped at 43 characters because the ScaledObject name
+  `n8n-worker-<name>` must fit KEDA's 54, and `"default"` is refused since
+  `jobs-default` is not the default queue. The node-capacity check in
+  `scaling.tf` now counts every pool at its ceiling.
+
+  **Upstream dependency, alpha on both sides.** n8n's own worker pools feature
+  is alpha, and the chart support for it (`queueMode.workerGroups`,
+  n8n-io/n8n-hosting#189) is merged to the chart's `preview/worker-pools`
+  branch but not released to a numbered chart version; a chart that predates
+  it accepts the key and silently renders nothing, so the release applies
+  clean with the flag on and no pool behind it. A precondition on the Helm
+  release fails the plan when the pinned `n8n_chart_version` is a numbered
+  release, since no numbered release carries the feature yet (a prerelease
+  version is taken at the caller's word, which is how a preview build is
+  installed; the new `n8n_worker_pools_chart_verified` input lets a caller
+  attest a numbered release instead, for a private mirror already verified
+  to carry the feature), and a `check` in `worker-pools.tf` warns when a pinned
+  `n8n_image_tag` is below `2.39.0`, the first n8n release that reads the pool
+  variables. n8n-io/n8n-hosting#191 registered a `Preview chart` GitHub Action
+  that can publish an official prerelease build from `preview/worker-pools`
+  to `oci://ghcr.io/n8n-io/n8n-helm-chart` (this module's default
+  `n8n_chart_repository`), e.g. `1.11.0-preview.workerpools.1`; a private
+  mirror remains a fallback for anyone without write access to that repo.
+  The `feat:workerPools` licence entitlement is required as well, and its
+  absence is not silent: n8n 2.39.0
+  exits 1 on a worker started with `N8N_WORKER_POOL_NAME` it is not licensed
+  for, so the pool pods crash-loop and the Helm release is rolled back,
+  failing the apply. Terraform cannot see entitlements at plan. The example
+  README documents the log line and the cached-certificate gotcha when an
+  entitlement is added to an already-activated key.
+  `tests/scripts/verify-worker-pools.sh`
+  counts the rendered pools after a live apply, which is the only place the
+  silent case is visible.
+
+  Measured end to end on a live cluster: a project pinned to a pool has its
+  executions enqueued to `jobs-<pool>` and run only by that pool's workers,
+  with the default queue's counter unchanged; unassigning it reverts on the
+  next execution. `min_replicas = 0` works: a job routed to a parked pool
+  waits on the pool queue and KEDA scaled it 0 to 1 within one 15-second
+  polling interval, so there is no fallback to the default queue. The caveat
+  is bootstrap: n8n lists a pool in a project's Worker Pools setting only
+  while one of its workers is registered, so a pool that starts at 0 cannot
+  be assigned until it is raised to 1 once; the stored assignment then
+  survives the scale-down. Documented on the input and in the example.
+
+- `n8n_worker_extra_env`: worker-only environment variables via the chart's
+  `queueMode.workerExtraEnv`, reaching the default worker deployment and every
+  pool alike. Same plan-time guards as `n8n_extra_env` plus a C_IDENTIFIER
+  name check. Default `[]`, which omits `queueMode.workerExtraEnv` from the
+  Helm values rather than sending an empty list, so this is additive with no
+  plan diff for a caller who does not set it.
+  `n8n_credentials_overwrite_secret_ref`'s conflict validation now covers this
+  input and each pool's `extra_env` as well as `n8n_extra_env`: all three are
+  appended after the module's own `CREDENTIALS_OVERWRITE_DATA_FILE`, and n8n's
+  `readEnv` prefers `CREDENTIALS_OVERWRITE_DATA` wherever it appears, so a
+  worker-only entry would otherwise leave workers running different credential
+  overwrites from the mains with nothing to announce it.
+
+- `examples/worker-pools/` (**Early Alpha, subject to change without notice**):
+  topology variant of `small` running three pools (`heavy`, `secteam`,
+  `itop`, the last parked at `min_replicas = 0`) with `node_max` raised from
+  6 to 8 to hold their ceilings. `n8n_chart_version` is a required input
+  there, since the module default renders no pools, and its README documents
+  both the official GHCR preview-build path and packaging one to a private
+  mirror, plus an end-to-end routing test. Carries the same six deletion
+  controls and the same "Production considerations" table as every other
+  example the module builds RDS and S3 for, and is covered by
+  `scripts/check-example-parity.sh`, whose allowlist explains the three chart
+  inputs and two default-worker KEDA bounds it declares beyond `small`'s.
+  Draft until the chart and n8n releases both ship.
+
+- `tests/scripts/verify-worker-pools.sh`: post-apply check for
+  `n8n_worker_pools`. Reads `worker_pool_names` and `namespace` from the
+  example's outputs (or `WORKER_POOLS` / `NAMESPACE` from the environment) and
+  asserts, per pool, the Deployment and ScaledObject exist and are labelled,
+  the ScaledObject is `READY=True`, its triggers watch `jobs-<pool>` with the
+  default worker's Redis TLS and AUTH metadata, pods carry
+  `N8N_WORKER_POOL_NAME`, and the mains carry `N8N_WORKER_POOLS_ENABLED`.
+
+### Changed
+
+- `db_backup_retention_period` is now `nullable = false`. A caller writing
+  `db_backup_retention_period = null` in a `module` block previously
+  propagated the null into the variable's own `>= 0` validation and failed
+  the plan with "argument must not be null"; it now falls back to the
+  default of `7`. No effect on callers who set a number or leave it unset.
+  Surfaced by the `examples/small`/`medium` pass-through above.
+- **Kubernetes provider requirement bumped to `~> 3.0`** (was `~> 2.0`), across
+  all 13 `versions.tf`/`providers.tf` files in the repo (root,
+  `modules/controllers`, every `examples/*`). Provider 3.0 deprecates every
+  unversioned Kubernetes resource type in favor of its `_v1` twin. This
+  module still uses `kubernetes_namespace` and three `kubernetes_secret`
+  resources unversioned, and `examples/large/pgbouncer.tf` uses an unversioned
+  `kubernetes_namespace`, `kubernetes_secret`, `kubernetes_deployment`, and
+  `kubernetes_service`; all of them now plan with a cosmetic "Deprecated
+  Resource" warning. Not renamed in this release: the provider does not
+  support a `moved` block across that rename (`hashicorp/terraform-provider-kubernetes`
+  issue #2812, "Move Resource State Not Supported", still open), so renaming
+  in source with no working automatic migration would force every existing
+  deployment to destroy and recreate its namespace, taking everything inside
+  it down too. See `docs/versioning.md`'s verification-required tier.
+
+  **The in-place 2.x → 3.x upgrade of existing state was verified live**:
+  `examples/small` applied on 0.4.0 (provider 2.38.0), then `terraform init
+  -upgrade` and `plan` on this release. Result: 0 to add, 2 to change, 0 to
+  destroy, where the two changes are the in-place Helm release updates
+  described under "What moves on apply". No action, refresh or otherwise, on
+  `kubernetes_namespace`, either `kubernetes_secret`, `kubernetes_ingress_v1`,
+  `kubernetes_horizontal_pod_autoscaler_v2`, or `kubernetes_storage_class_v1`;
+  RDS stayed untouched. The apply completed in about two minutes, the
+  rollout completed, and `tests/scripts/smoke-test.sh` passed 31/31
+  afterwards. Still run `terraform init -upgrade` and `terraform plan` on
+  your own deployment and read the plan before applying, since the
+  provider's own v3 upgrade guide warns that some resources may show updated
+  defaults; report any action beyond the two Helm release updates as an
+  issue. If your root module declares its own `kubernetes` provider
+  constraint at `~> 2.0`, widen it first or `init` cannot satisfy both.
+- **`time` provider requirement bumped to `~> 0.14`** (was `~> 0.12`). Purely
+  additive upstream (new resource-agnostic functions, no breaking changes
+  between 0.12 and 0.14 per its own CHANGELOG); no plan diff.
+- **Default `n8n_chart_version` bumped to `1.11.0`** (was `1.10.0`). See
+  "What moves on apply" above for what the chart changed and why it is inert
+  here. `docs/helm-chart-coverage.md` re-verified against the new version and
+  `tests/scripts/check-main-chart.sh` passes against it.
+- **Default `metrics_server_chart_version` bumped to `3.14.0`** (was
+  `3.13.1`). Requires Kubernetes `1.34+`; see "What moves on apply" above for
+  the pin older clusters need. `modules/controllers/variables.tf` declares its own copy of this
+  variable and moved with it; `examples/customer-managed-everything` is the
+  only root module that invokes `module.controllers` directly and would
+  otherwise have deployed the stale default.
+- **Default `db_engine_version` bumped to `18.6`** (was `18.4`), tracking
+  AWS's currently supported RDS PostgreSQL 18 minor.
+  `examples/customer-managed-everything`'s `customer_managed_db_engine_version`
+  default moved with it, matching its own description's promise to track the
+  module's default.
+- CI toolchain currency: `TF_VERSION` `1.16.2` (was `1.15.8`),
+  `TFLINT_VERSION` `v0.64.0` (was `v0.53.0`), `CHECKOV_VERSION` `3.3.17` (was
+  `3.3.9`), and the `chart` job's `azure/setup-helm` pin `v4.3.0` (was
+  `v4.2.4`). `TERRAFORM_DOCS_VERSION` is already latest (`v0.24.0`); no
+  change.
+- The main Deployment's Helm values now set the chart's top-level
+  `replicaCount` explicitly (`n8n.tf`), in addition to `multiMain.replicas`.
+  `deployment-main.yaml` reads `multiMain.replicas` only while
+  `multiMain.enabled`; single-main mode (`n8n_main_hpa_min_replicas == 1`)
+  reads the chart's own `replicaCount` instead, which this module previously
+  left to the chart's default. Both resolve to `1` today, so the rendered
+  replica count does not change; setting the key does trigger the one-time
+  in-place `helm_release.n8n` update described under "What moves on apply"
+  above, for every existing deployment regardless of pinned chart version.
+  This closes a latent gap where a future chart release changing that
+  default would have silently changed the single-main replica count with no
+  line in this module to catch it.
+- `n8n_extra_env` and `n8n_worker_extra_env` now reject `N8N_WORKER_POOLS_ENABLED`
+  and `N8N_WORKER_POOL_NAME`, which `n8n_worker_pools` owns. A caller who was
+  setting either through the escape hatch fails at plan on upgrade rather than
+  silently: set through `n8n_extra_env` the pool name would put every main,
+  worker and webhook pod into one pool, and the flag alone would switch routing
+  on with no pool to route to. Declare the pool with `n8n_worker_pools` instead.
+
+### Fixed
+
+- `n8n_image_pull_secrets` (root module and all 10 shipped examples) now
+  bounds each dot-separated label of a secret name to 63 characters,
+  matching Kubernetes' actual DNS-1123 subdomain rule, not just the
+  253-character total-length check that existed already.
+  `webhook_subdomain` (`examples/split-ingress/`) gets the same
+  63-character bound folded into its existing single-label validation.
+  Values that were always going to be rejected by Kubernetes now fail at
+  `terraform plan` instead. See #126.
+- `tests/scripts/smoke-test.sh` misdetected every multi-main deployment
+  (this module's own default topology) as single-main. Auto-detection read
+  `N8N_MULTI_MAIN_SETUP_ENABLED`'s `.value` field on the main Deployment
+  spec, but the n8n Helm chart only ever sets that variable via
+  `valueFrom.configMapKeyRef` (unchanged across chart `1.10.0` and `1.11.0`),
+  so the field is always empty and the script always fell through to
+  "single-main", then failed the four checks that only apply there (HPA
+  pinned to 1/1, `Recreate` strategy, PDB `minAvailable=0`) against a
+  correctly running multi-main deployment. Detection now checks the env
+  entry's presence (`.name`) instead. Found via a live `terraform apply` of
+  `examples/small` against this release.
+- The CI checkov job never evaluated `kubernetes_deployment_v1.redis_exporter`,
+  and #120's diagnosis of why was wrong. checkov does register the
+  `_v1`/`_v2` Kubernetes resource types; what hid the resource is that it
+  answers every check on a count-0 resource with `UNKNOWN` and drops it from
+  the report, and `redis_exporter_enabled` is `false` in the module defaults
+  and in every example. Scanned with the toggle on, the resource drew the
+  same 27 `CKV_K8S_*` checks as an always-on Deployment, three of which had
+  been failing untriaged. `tests/scripts/check-checkov.sh` now runs a second
+  pass with `tests/checkov/opt-in.tfvars` and fails if that pass does not
+  reach each listed opt-in resource, so this class of gap cannot reopen
+  silently. `terraform test` gained assertions pinning the exporter's
+  security context, capabilities, memory limit, digest pin, and probes for
+  the fields checkov has no Terraform check for. The corrected diagnosis is
+  recorded in `AGENTS.md` ("Static analysis"). See #120.
+- `n8n_domain` and `n8n_additional_domains` now enforce the DNS name rules
+  that ACM's `RequestCertificate` pattern, the ALB Ingress `host`, and n8n's
+  own `N8N_HOST`/`WEBHOOK_URL` handling all apply downstream: every
+  dot-separated label is 63 characters or fewer, the whole name 253 or fewer,
+  and no label is empty or starts or ends with a hyphen. The previous regex
+  bounded no length and accepted `n8n..example.com` and `n8n.-prod.example.com`,
+  which always failed at apply rather than at plan. `n8n_domain` additionally
+  gets a `precondition` on `aws_acm_certificate.n8n` rejecting anything over
+  64 characters when the module issues the certificate (`route53_zone_id`
+  set): RFC 5280 caps a certificate's Common Name at 64 octets, tighter than
+  the 253-octet SAN limit `n8n_additional_domains` gets, and ACM previously
+  only rejected it mid-apply, after Terraform had already started creating
+  the EKS cluster, RDS and ElastiCache. `examples/split-ingress`'s composed
+  `webhook_domain` needed no separate check: it already flows straight into
+  `n8n_additional_domains`, so the same validation covers it end to end.
+  `examples/cloudflare` and `examples/godaddy` issue the certificate
+  themselves, so the module's precondition never reaches them; each gets
+  the same 64-character `validation` on its own `n8n_domain`. See #131.
+- `examples/cloudflare` and `examples/godaddy` did not document why they omit
+  the module's `n8n_additional_domains` input, which `examples/small`,
+  `medium`, and the customer-managed examples pass through (`split-ingress`
+  composes it from `webhook_subdomain`; `large` omits it too, by design): it
+  read as drift rather than a deliberate difference. Both READMEs now
+  explain that the input only
+  reaches the certificate on the module's own Route 53 issuance path: these
+  two examples issue a single-Common-Name certificate themselves, and the
+  module cannot add subject alternative names to a certificate it did not
+  issue. Audited both examples' `variables.tf`/`main.tf` against
+  `examples/small` for every other module input; found no further gaps. See
+  #136.
+- `examples/customer-managed-redis`, `examples/customer-managed-s3`, and
+  `examples/customer-managed-cluster` had no "Production considerations"
+  section at all, unlike the other examples that keep module-owned RDS or
+  S3. Each still lets the module create RDS and/or S3 with the same
+  teardown-friendly defaults `examples/small` documents (only
+  `customer-managed-everything` avoids every module-owned resource these
+  defaults apply to, via `create_database = false` and `create_s3_bucket =
+  false`, so it correctly has no such section). Verified by auditing every
+  `examples/*/variables.tf` against `examples/small`'s and checking each
+  example's actual `create_database`/`create_s3_bucket` wiring, not assumed
+  from the example's name. `-s3` gets only the four database rows: the
+  module's `s3_force_destroy` is a no-op there and its own bucket's
+  `force_destroy` is already the `customer_managed_s3_force_destroy`
+  variable. Every section now uses the same "Module input" table as
+  `examples/small` and says the inputs are passed through. See #136.
+
+### Security
+
+- `redis_exporter_image`'s default is now pinned by digest as well as tag
+  (`oliver006/redis_exporter:v1.90.0@sha256:a129504e...`, the multi-arch
+  index, so it resolves on x86_64 and Graviton nodes alike). The tag alone
+  was mutable, so the `IfNotPresent` pull policy a tagged image gets by
+  default could keep running a superseded image; the digest makes the
+  reference immutable and the default pull policy safe. Callers who set
+  `redis_exporter_image` themselves are unaffected. Deployments on the
+  default with `redis_exporter_enabled = true` roll the exporter pod once on
+  the next apply; nothing changes for the default `false`. Fixes checkov
+  `CKV_K8S_15` and `CKV_K8S_43` on merit. The one remaining finding,
+  `CKV_K8S_11` (no CPU limit), is a deliberate trade annotated at the
+  resource: a CFS-throttled exporter reports late during exactly the
+  incident it exists for.
+
+### Compatibility
+
+- **Kubernetes provider:** `~> 3.0` (see upgrade note under **Changed**).
+- **`time` provider:** `~> 0.14`.
+- **n8n Helm chart:** default `1.11.0`.
+- **PostgreSQL:** default `18.6`.
+- **Kubernetes:** `kubernetes_version` default stays `1.35`. EKS made `1.36`
+  generally available June 2, 2026, but it is kept off deliberately: `checkov`
+  3.3.17 hardcodes `CKV_AWS_339`'s allow-list at `1.35` with no `1.36` entry,
+  and `1.35` remains in AWS's 14-month standard-support window, so there is
+  no currency gap to close by moving to a version this repo's own security
+  gate cannot yet vouch for. See `docs/versioning.md`.
+- **Live-verified** on a fresh `terraform apply` of `examples/small` (EKS
+  `1.35`, RDS `18.6`, ElastiCache Redis `7.1`, n8n chart `1.11.0`): all pods
+  `Running`, Redis-backed leader election active, KEDA/HPA scaling configured,
+  ALB routing every webhook/form/MCP prefix, Enterprise license active.
+- **`n8n_image_tag`:** guidance unchanged. n8n's latest release remains
+  inside the 2.x major the variable's description warns about crossing.
+
+### Known limitations
+
+- `examples/large`'s `aurora_engine_version` stays at `18.4`: AWS's August
+  2026 announcement lists it as the newest Aurora PostgreSQL 18 minor, so the
+  pin is current. See `docs/versioning.md` for why the next bump needs a live
+  `aws rds describe-db-engine-versions` call.
+- ElastiCache Redis engine version is unchanged: `7.1` is the ceiling for
+  Redis OSS on ElastiCache. AWS now recommends Valkey for new deployments,
+  but that is a distinct `engine` value with its own migration path, not a
+  version bump, and out of scope here. See `docs/versioning.md`.
+
+## [0.4.0] - 2026-09-14
+
+### Added
+
+- `n8n_credentials_overwrite_secret_ref`: mounts one key from a
+  caller-managed Kubernetes Secret read-only on main, worker, and webhook
+  processor pods and points `CREDENTIALS_OVERWRITE_DATA_FILE` at it. The module
+  accepts only the Secret name and key, so the credential overwrite JSON does
+  not enter its Helm values or managed resources. The input defaults to `null`,
+  preserving existing behavior.
+
+  When set, plan-time validation rejects `CREDENTIALS_OVERWRITE_DATA` and
+  `CREDENTIALS_OVERWRITE_DATA_FILE` in `n8n_extra_env`, the managed
+  `credentials-overwrite` volume name in `n8n_extra_volumes`, and the managed
+  `/etc/n8n/credentials-overwrite` path in `n8n_extra_volume_mounts`. These
+  names remain available through the escape hatches while the new input is
+  null, preserving existing configurations.
+
+  n8n reads overwrite data at startup. Rotating the caller-managed Secret does
+  not roll pods because the module deliberately does not read or hash the
+  payload. Restart the `n8n-main`, `n8n-worker`, and
+  `n8n-webhook-processor` deployments manually after rotation.
+
+- `multiMain.enabled` is now gated on `n8n_main_hpa_min_replicas > 1` instead
+  of hardcoded `true`. Setting `n8n_main_hpa_min_replicas = 1` deploys a
+  single main pod in plain queue mode with no `feat:multipleMainInstances`
+  license entitlement required, so a Business-tier `n8n_license_key` can run
+  this module in that topology. `n8n_main_hpa_min_replicas > 1` (the default,
+  2) is unchanged and still requires that entitlement. The main-pod HPA's
+  ceiling (`n8n_main_hpa_max_replicas`) is clamped to 1 whenever multi-main
+  is disabled, regardless of its own value, so the HPA cannot scale a second,
+  un-electable main pod into duplicate scheduled/cron executions. The
+  autoscaling-capacity advisory (`scaling.tf`) reads this same clamped
+  ceiling too, so a single-main plan with a high configured
+  `n8n_main_hpa_max_replicas` no longer reports a false "insufficient CPU"
+  warning against a ceiling the HPA can never actually reach. See #117.
+
+  Single-main upgrades now use `Recreate`, with `rollingUpdate: null` to
+  clear previous rollout settings. Old main pods stop before their replacement
+  starts, preventing upgrade overlap without leader election. The main
+  PodDisruptionBudget uses `minAvailable = 0` so node maintenance can evict the
+  only main. Multi-main keeps the chart's rollout strategy and a disruption
+  budget of one. Worker and webhook strategies are unchanged. Terraform tests
+  and a CI-gated chart-rendering check cover both topologies.
+  `tests/scripts/smoke-test.sh` detects single-main from the multi-main flag
+  on the main Deployment and asserts HPA `1/1`, `Recreate`, and
+  `minAvailable = 0` instead of warning about a missing second main. Verified live on
+  `examples/small` with a Business-tier key: no second main during a rollout,
+  and a node drain evicted the single main (about 20 to 30 seconds of
+  downtime each; see `docs/upgrading-n8n.md`).
+
+  **Upgrade note:** there are no existing minimum-one deployments to migrate.
+  Before this change `n8n_main_hpa_min_replicas = 1` was rejected by the
+  chart's values schema (`multiMain.replicas: minimum: got 1, want 2`), so it
+  never applied. Existing default (multi-main) deployments see `No changes` on
+  upgrade; verified with a live plan from the previous release. Moving from
+  multi-main to single-main is an in-place `helm_release` update: both mains
+  stop, then one starts. In single-main mode, main upgrades and node
+  maintenance require downtime for the editor, REST API, and scheduled
+  triggers. `Recreate` controls upgrades, not manual pod deletion or node
+  failure; it is not a general at-most-one guarantee. See
+  `docs/upgrading-n8n.md`, and `docs/troubleshooting.md` for the stuck
+  Deployment a failed switch to `>= 2` can leave behind.
+
+- Every shipped example now exposes `n8n_main_hpa_min_replicas` as a
+  passthrough variable (`examples/small`, `medium`, `large`, `cloudflare`,
+  `godaddy`, `split-ingress`, `customer-managed-redis`,
+  `customer-managed-s3`, `customer-managed-cluster`,
+  `customer-managed-everything`), so setting it is a plain `terraform.tfvars`
+  change, no hand-edited example files needed. `medium` and `large` already
+  hardcoded tier-specific defaults (3 and 6) for main-pod concurrency; those
+  are preserved as each example's own variable default rather than the
+  module's default of 2. See #117.
+
+- `node_disk_size`: root EBS volume size in GiB for the EKS worker nodes.
+  Defaults to `null`, which keeps the EKS managed-node-group default of 20
+  GiB, so this is additive and no existing deployment changes.
+
+  Previously unsettable by any means: `aws_eks_node_group.n8n` set no
+  `disk_size` and there was no input for it, so every deployment took 20
+  GiB regardless of pod density. 20 GiB is tighter than it looks: about 7.7
+  GiB per node is consumed before any workload growth (OS files plus
+  container images), and the kubelet evicts pods at around 2.1 GiB
+  available, leaving roughly 11 GiB of usable headroom rather than 20.
+
+  Size it for transient spikes, not steady state: a 42-node cluster running
+  n8n at load was observed sitting flat for an hour and then consuming 13
+  to 14 GiB per node in about four minutes, across 40 of 42 nodes at once,
+  evicting 279 pods in one episode. Changing this on an existing cluster
+  replaces every node in the group.
+
+- `db_ping_timeout_ms`, `db_ping_interval_seconds` and
+  `db_ping_max_failures_before_recovery`: expose n8n's database health-check
+  ping settings (`DB_PING_TIMEOUT_MS`, `DB_PING_INTERVAL_SECONDS`,
+  `DB_PING_MAX_FAILURES_BEFORE_RECOVERY`). All default to `null`, which omits the
+  variable and leaves n8n's own defaults (5000ms, 2s, 3), so this is additive.
+
+  Previously unsettable by any means: the chart has no values path for them, and
+  `DB_` is a module-managed prefix so `n8n_extra_env` rejects them at plan time.
+
+  These govern a failure mode worth understanding before tuning anything else.
+  n8n's ping acquires a connection from the same pool that serves request
+  traffic (`pool.connect()` in `db-connection-monitor.ts`, raced against
+  `pingTimeoutMs`), so a pool saturated by ordinary load makes the ping time out
+  while the database is entirely healthy. A single timed-out ping sets
+  `connectionState.connected = false`, and the global middleware in
+  `abstract-server.ts` then answers every request to that pod with a 503,
+  creating no execution row and logging nothing at the failure site. After
+  `DB_PING_MAX_FAILURES_BEFORE_RECOVERY` consecutive failures, n8n destroys and
+  recreates the pool and suspends acquisition while it does. At the defaults,
+  recovery starts roughly 6 seconds after monitoring begins when each ping fails
+  immediately, but roughly 21 seconds after monitoring begins when each ping
+  consumes the full 5-second timeout, as it does when `pool.connect()` is queued
+  behind saturated traffic. In that case recovery is a feedback loop rather
+  than a recovery. Size the pool from measured concurrent database operations
+  and pool-wait time, while keeping aggregate capacity across all replicas
+  within PgBouncer and database limits. Raising these settings is a mitigation
+  when the queue cannot be removed.
+
+- `db_postgresdb_connection_timeout_ms`: expose `DB_POSTGRESDB_CONNECTION_TIMEOUT`.
+  Defaults to `null`, which omits the variable and leaves n8n's own default of
+  20000ms, so this is additive. Zero disables pg-pool's acquisition timeout;
+  values above 2147483647 are rejected because Node.js reduces larger timer
+  delays to 1ms.
+
+  Previously unsettable by any means: the chart has no values path for it and
+  `DB_` is a module-managed prefix, so `n8n_extra_env` rejects it at plan time.
+
+  n8n passes it to pg-pool as `connectionTimeoutMillis`, where it bounds both
+  establishing a connection and waiting for a busy pool to free a slot. That
+  includes the database monitor's `pool.connect()` call. The monitor separately
+  races the call against `DB_PING_TIMEOUT_MS`, so the two settings are configured
+  separately but are not runtime-independent: health-check acquisition stops
+  when whichever timeout fires first.
+
+  Raising it is not a fix. Measured over a two-hour run, acquire time on
+  individual pods climbed smoothly from 0.4s past 25s while the fleet average
+  stayed near 3s and Aurora sat at 2.3% CPU, so any fixed threshold is
+  crossed eventually and only the timing moves. Exposed so the knob
+  governing the failure is settable, including downward for fail-fast
+  behaviour.
+
+- `n8n_queue_worker_lock_duration`, `n8n_queue_worker_lock_renew_time` and
+  `n8n_queue_worker_stalled_interval` - expose the chart's
+  `redis.worker.lockDuration`, `redis.worker.lockRenewTime` and
+  `redis.worker.stalledInterval` (`QUEUE_WORKER_LOCK_DURATION`,
+  `QUEUE_WORKER_LOCK_RENEW_TIME` and `QUEUE_WORKER_STALLED_INTERVAL` on the
+  pods). All default to `null`, which omits the key entirely and leaves the
+  chart's own defaults (60000 / 10000 / 30000 ms), so this is additive.
+
+  These three keys are chart-templated from `redis.worker.*` and are not
+  names `n8n_extra_env` can safely set: the chart's ConfigMap entries for
+  them render unconditionally, so a duplicate in `extraEnv` produces a
+  container env entry carrying both `value` and `valueFrom`, which the
+  Kubernetes API rejects outright.
+
+  The three keys are assembled in a single `local.n8n_queue_worker_settings`
+  map. The surrounding `merge()` in `n8n.tf` is shallow, so passing them as
+  three separate `{ worker = {...} }` entries would have silently kept only
+  the last: setting a lock duration and a stalled interval together would
+  have dropped one of them with no error.
+
+  The renewal interval must stay strictly below the lock duration, and the
+  validations enforce that against the effective value rather than the
+  literal one. Lowering `n8n_queue_worker_lock_duration` to `10000` ms or
+  less while leaving `n8n_queue_worker_lock_renew_time` null is rejected,
+  because the chart would keep its own `10000` ms renewal default: the lock
+  would expire at or before the first renewal ever fired, and Bull would
+  treat every job on a perfectly healthy worker as stalled. Set the renewal
+  interval explicitly below the duration to run a short lock.
+
+  All three are validated as whole numbers. The chart's `values.schema.json`
+  declares every `redis.worker.*` key as `{"type": "integer"}`, so a
+  fractional value would otherwise pass the module and fail later during
+  Helm schema validation at apply time.
+
+  `n8n_queue_worker_stalled_interval` cannot be set to `0`. n8n documents
+  `0` as "disable stall checking", but the chart's `values.schema.json`
+  declares the key as `{"type": "integer", "minimum": 1000}`, so `0` is
+  rejected during Helm schema validation and a quoted `"0"` is rejected as
+  the wrong type. The variable validates for `>= 1000` so this surfaces at
+  plan time with an explanation, rather than as a Helm schema error naming
+  a values path and no reason. Disabling stall checking requires an
+  upstream chart change.
+
+  `QUEUE_WORKER_MAX_STALLED_COUNT` is deliberately not exposed. The chart
+  still renders it (`redis.worker.maxStalledCount`, default `1`), but n8n
+  v2 removed the environment variable and ships a breaking-change rule
+  stating it is ignored, while `packages/cli/src/scaling/scaling.service.ts`
+  hardcodes Bull's `maxStalledCount` to `0`. Exposing it would offer
+  control that does not exist.
+
+- `n8n_executions_data_save_on_success` and `n8n_executions_data_save_on_error`
+  replace two hardcoded `"all"` literals in `config.data.saveOnSuccess` /
+  `saveOnError`, so execution-data retention on success and failure can be
+  configured independently. Both default to `"all"`, matching the previous
+  hardcoded behavior, so this is additive: no existing deployment's rendered
+  values change.
+
+  The chart renders both keys unconditionally from these values. If a caller
+  also set the same key through `n8n_extra_env`, the main and worker
+  Deployments ended up with the key listed twice in one container's env list,
+  which is not merely untidy: the merge key for a container `env` list is
+  `name`, so a duplicate makes Kubernetes' strategic-merge-patch ambiguous
+  about which occurrence a later change lands on, and Kubernetes honors the
+  *last* entry at container start, so a stale value can silently win. Observed
+  on a live cluster 2026-08-24: after flipping the value to `"all"`, the
+  webhook-processor (which rendered the key once) correctly reported `"all"`,
+  while main and worker (which rendered it twice) both still reported `"none"`
+  five minutes and three rollout checks later, with the Helm release's own
+  manifest already showing `"all"` in both positions. That failure mode is
+  closed by the `n8n_extra_env` guard tightening described under **Changed**,
+  below.
+
+- `n8n_executions_data_save_on_progress` and
+  `n8n_executions_data_save_manual_executions` replace the remaining two
+  hardcoded `config.data` literals (`saveOnProgress = false`,
+  `saveManualExecutions = true`), so every guarded `EXECUTIONS_DATA_SAVE_*`
+  name has a dedicated, validated input rather than a blocked escape hatch.
+  Both default to the previous hardcoded values (which are also n8n's own
+  defaults), so this is additive: no existing deployment's rendered values
+  change.
+
+- `n8n_task_runner_custom_config` mounts a custom task-runner launcher config
+  (`n8n-task-runners.json`) from a caller-created ConfigMap, wiring the chart's
+  `taskRunners.customConfig`. Defaults to `null`, which keeps the previous
+  behavior of using the runner image's baked-in config, so this is additive and
+  no existing deployment changes.
+
+  This is the only way to set the runner allow-lists. The runner image ships
+  the native Python runner with `N8N_RUNNERS_STDLIB_ALLOW` as an empty string,
+  which refuses every stdlib import, so a Python Code node doing `import time`
+  or `import math` fails with "Import of standard library module 'x' is
+  disallowed" even with `n8n_task_runner_python_enabled = true`. There is no
+  env-var equivalent: the allow-list names are absent from each runner's
+  `allowed-env`, so the launcher never forwards a pod-level env var to the
+  runner process, and the file's own `env-overrides` block is applied
+  regardless and would win.
+
+  The ConfigMap replaces the whole launcher config rather than one key, so
+  derive it from the running image (`kubectl exec deploy/n8n-worker -c
+  task-runner -- cat /etc/n8n-task-runners.json`) and re-derive it when the
+  runner image changes. Validation holds `config_map_name` to the DNS-1123
+  subdomain rule Kubernetes applies to a ConfigMap name and `config_map_key` to
+  the separate, case-sensitive rule it applies to a key, rejects both empty, and
+  requires `n8n_task_runners_enabled = true`.
+
+  Editing the ConfigMap later does not restart anything. The chart mounts the
+  key with `subPath`, which never picks up subsequent ConfigMap updates, and the
+  module is given the ConfigMap's name rather than its contents, so it has
+  nothing to hash into a pod annotation the way it does for a module-managed
+  Redis auth token. Roll the deployments yourself after every launcher-config
+  change: `kubectl rollout restart deploy/n8n-main deploy/n8n-worker`.
+
+- `n8n_dns_config` - pod-level DNS settings (the chart's `dnsConfig`) applied
+  to the main, worker and webhook-processor pods. Defaults to `null`, which
+  omits the block and leaves Kubernetes' defaults in place, so this is
+  additive and no existing deployment changes.
+
+  Kubernetes injects `options ndots:5` plus four search domains into every
+  pod. Any hostname with fewer than 5 dots is tried against all four search
+  domains before being tried as written, so it costs five DNS queries, four
+  of which are guaranteed `NXDOMAIN`. Every AWS endpoint with 4 dots or fewer
+  (an S3 bucket endpoint, an in-cluster `*.svc.cluster.local` name) pays that
+  cost on every lookup; RDS and ElastiCache endpoints have 5+ dots and are
+  unaffected.
+
+  Measured on a 246-pod deployment at roughly 670 req/s: setting `ndots: 1`
+  cut DNS query volume by 80% (12,794 to 2,559 queries/s sustained), eliminated 341
+  failed requests out of 122,505 caused by `getaddrinfo EAI_AGAIN` under
+  CoreDNS saturation, and dropped max request latency from 15.1s to 1.9s.
+  `ndots: 1` only affects names that already contain a dot; a bare
+  single-label service reference still uses the search path and needs
+  rewriting to an FQDN first.
+
+- `n8n_node_max_old_space_size_mb`: set V8's old-space heap ceiling, emitted as
+  `NODE_OPTIONS=--max-old-space-size=<value>` on every n8n container. Defaults
+  to `null`, which omits the variable entirely and leaves V8's own default, so
+  this is additive and no existing deployment changes.
+
+  Previously unsettable by any means: nothing in the chart or the module set
+  `NODE_OPTIONS`, so every container took V8's default ceiling.
+
+  That default is the point. V8 sizes the heap at roughly half the container
+  memory limit, capped at about 2 GiB on the pinned image (measured: 1Gi →
+  ~536 MiB, 2Gi → ~1072 MiB, 4Gi → ~2144 MiB), so `n8n_main_memory_limit` /
+  `n8n_worker_memory_limit` / `n8n_webhook_memory_limit` above about 4Gi buy
+  memory the Node process can never allocate. Measured during load validation: webhook pods died at the
+  2,033 MB ceiling with half of their 4 GiB container limit unused, peak heap
+  sitting at 97% of the ceiling when the pods were lost.
+
+  `config.extraEnv` is chart-global and the chart has no per-tier env path, so
+  one value applies to main, worker and webhook processor alike. Size it
+  against the smallest of the three memory limits, leaving roughly 25% for
+  non-heap memory. Note the caveat in the variable description: on builds
+  affected by the webhook-tier heap leak, a higher ceiling delays the fleet
+  death rather than preventing it, and GC pauses lengthen as heap approaches
+  any ceiling, so it belongs alongside a scheduled rolling restart of that
+  tier rather than in place of one.
+
+- `db_apply_immediately`: apply RDS instance modifications immediately instead
+  of deferring them to the next maintenance window. Defaults to `false` (the
+  AWS default), which is also what existing instances already hold in state,
+  so they see no plan change. Exists because a `db_instance_class` change
+  otherwise reports "Apply complete" while AWS queues the change in
+  `PendingModifiedValues` for a window that can be days out. The apply output
+  does not say so; the only symptom is that every following `terraform plan`
+  wants to make the same class change again until the window passes (measured
+  incident during load validation; both the database and Redis had to be
+  forced through the AWS CLI). Set it true for the apply that carries a
+  resize, verify the live class through AWS, then unset it. Measured live: a
+  `db.t3.small` to `db.t3.medium` change on a Multi-AZ instance took 17
+  minutes end to end.
+
+### Changed
+
+- The module now sets n8n's current `N8N_WEBHOOK_URL` environment variable
+  alongside the legacy `WEBHOOK_URL`, using the same `n8n_webhook_url` value
+  for both. Existing deployments keep the same webhook base URL while no
+  longer relying only on n8n's legacy compatibility path.
+- **`examples/large` now carries the values load validation round 2 measured
+  on this deployment class**, replacing the reasoning that shipped with them.
+  `db_postgresdb_pool_size` 5 to 20: pool 5 was the exact value behind a
+  silent-503 storm in which pool acquisition backlogged, n8n's database
+  health-check ping (which shares the pool) timed out, and pods misdiagnosed a
+  healthy Aurora as dead. `redis_node_type` `cache.r6g.large` to `2xlarge`: a
+  throughput A/B measured a hard 869 req/s ceiling on `large` that lifted to
+  897-906 req/s with no other change. `n8n_worker_keda_max_replicas` 160 to
+  320: the endurance headline ran at 320 workers, and throughput at this tier
+  scales in pod count. `node_disk_size = 100`: the fleet-wide disk eviction
+  behind the new input happened on this deployment class. PgBouncer 2 to 4
+  replicas, so the client-connection budget (`MAX_CLIENT_CONN` 3,000 x 4)
+  stays above the ~9,200 connections the raised maxima can open. The 24-hour
+  pruning rationale is rewritten as a warning: hard deletion is hardcoded at
+  100 executions/s, so retention settings cannot bound table growth at this
+  tier. The example's README, `pgbouncer.tf` comments and test pin follow.
+  `examples/medium` gains the Redis upgrade trigger and the pruning caveat as
+  comments only; `examples/small` is untouched, since no evidence exists at
+  that scale. Examples only: no module input, output or resource changes.
+- `db_instance_class` and `n8n_execution_data_storage_mode` descriptions now
+  carry the evidence behind their guidance. Description-only: no default, type
+  or behaviour changes, and no plan output moves.
+
+  `db_instance_class` gains a sizing rule measured rather than guessed. Load
+  validation found a narrow band of **41 to 51 database transactions per
+  completed execution** across every clean workload type tested (no-op webhook,
+  a representative 34-node real workflow, HTTP-heavy and binary-heavy
+  variants), so required database TPS is roughly `target executions/s x 45`,
+  with a `db.r6g.8xlarge`-class Aurora writer sustaining 22,512 TPS as an upper
+  reference point. The band is per *execution*, so workflows triggering
+  sub-executions or heavy Code-node database access sit above it. The old
+  "db.t3.medium for higher load" hint is dropped in favour of the rule.
+
+  `n8n_execution_data_storage_mode` now says why `database` is the default:
+  in a matched A/B on the representative workflow, database execution storage
+  **outperformed s3 by 37.8% to 45.2%** in sustained throughput, because the
+  per-execution S3 write path costs more than the database write it replaces
+  long before the database itself becomes the bottleneck. `s3` is the lever
+  for a measured database constraint, not a default optimization.
+
+- **The module now sets `N8N_EDITOR_BASE_URL`** to `https://<n8n_domain>`,
+  emitted next to `WEBHOOK_URL` in the chart's `config.extraEnv`. The name was
+  already reserved in `local.n8n_managed_env_names` but never assigned, so
+  neither the module nor an operator (through `n8n_extra_env`, which rejects
+  reserved names) could set it, and n8n fell back to `WEBHOOK_URL` when
+  building the editor's base URL — including the OAuth2 credential callback.
+  Deployments where `n8n_webhook_url` names a different host than `n8n_domain`
+  previously advertised that callback on the webhook host, where it 404s: a
+  split ingress routes only the webhook prefixes there, and the webhook
+  processors serve no `/rest` routes even when reached. It now resolves to
+  `https://<n8n_domain>/rest/oauth2-credential/callback`.
+
+  **Upgrade note.** If `n8n_webhook_url` points at a different host than
+  `n8n_domain`, update the redirect URI registered with any OAuth2 provider to
+  the `n8n_domain` form above. Every other configuration renders the value n8n
+  already resolved to, so nothing changes there.
+
+- `db_postgresdb_pool_size` is now documented as a lazy per-process maximum,
+  not as one connection per concurrent workflow or request. Size it from
+  measured concurrent database operations and pool-wait time, then verify that
+  the aggregate maximum across main, worker, and webhook replicas fits the
+  PgBouncer and database connection budgets.
+
+- `n8n_extra_env` now rejects all four keys the chart renders from
+  `config.data`, `EXECUTIONS_DATA_SAVE_ON_SUCCESS`,
+  `EXECUTIONS_DATA_SAVE_ON_ERROR`, `EXECUTIONS_DATA_SAVE_ON_PROGRESS` and
+  `EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS`, outright at plan time (added to
+  `local.n8n_managed_env_names`), matching the existing guard on
+  `N8N_EXECUTION_DATA_STORAGE_MODE`, so the duplicate-key failure mode
+  described under **Added** can no longer be reproduced through this module.
+
+  **Upgrade note.** This tightens the plan-time contract: a configuration that
+  previously set any of these names through `n8n_extra_env` planned cleanly
+  (and deployed the duplicate-key hazard above) but now fails validation. Move
+  the value to the dedicated input (`n8n_executions_data_save_on_success` /
+  `_on_error` / `_on_progress` / `_manual_executions`) and remove the
+  `n8n_extra_env` entry. Per the stability contract this change rides a minor
+  release, not a patch.
+
+- `n8n_extra_env` now rejects `NODE_OPTIONS`, but **only while
+  `n8n_node_max_old_space_size_mb` is set**. Unlike a normal env var,
+  `NODE_OPTIONS` is a whole flag string, so a caller entry would replace the
+  module's `--max-old-space-size` outright rather than merging with it
+  (`config.extraEnv` is appended last and Kubernetes resolves duplicate names
+  last-wins), silently unpinning the ceiling the input says is in force.
+
+  The guard is deliberately conditional rather than a plain reserved name. At
+  the default (`null`) the module emits no `NODE_OPTIONS`, so there is nothing
+  to clobber and a caller passing it for unrelated Node flags
+  (`--enable-source-maps`, `--inspect`, their own heap flag) keeps working
+  untouched. Reserving it outright would have broken those callers at plan time
+  on upgrade, for a collision that cannot occur.
+
+- `redis_exporter_enabled` and `redis_exporter_image`: opt-in `redis_exporter`
+  (one Deployment plus a Service on `:9121`) pointed at the module's own Redis,
+  in a new `observability.tf`. Defaults to `false`: nothing is created, so this
+  is additive. The Deployment runs one replica with a `Recreate` strategy, so
+  no two exporter pods ever report the same counters at once, not even for one
+  scrape interval during an image bump.
+
+  It exists because the module could not show you the number that matters most.
+  Bull queue depth is the signal KEDA scales workers on and the first thing
+  worth looking at during an incident, and n8n's own `/metrics` does not report
+  it usefully in the multi-main topology this module deploys (and every tier
+  example uses): the queue gauge is per-main rather than per-queue, so the
+  figure misleads rather than going missing. Redis is the source of truth, and
+  this reads it directly, along with eviction counts, connected clients and
+  engine load.
+
+  Queue depth is exported explicitly via `REDIS_EXPORTER_CHECK_SINGLE_KEYS`,
+  not by default: the exporter's standard metrics come from Redis `INFO`, which
+  carries aggregate database statistics and no per-key lengths, so without it
+  the exporter would ship everything except the number it exists for. The keys
+  are the same `:jobs:wait` / `:jobs:active` pair the KEDA ScaledObject scales
+  on, built from the same local, so the autoscaler and any dashboard read one
+  queue rather than two, and both follow `redis_key_prefix`.
+
+  The exporter reuses the module's own Redis endpoint and, when AUTH is active,
+  the same token Secret the chart mounts as `QUEUE_BULL_REDIS_PASSWORD`, so it
+  cannot end up watching a different queue than n8n is running on. All three
+  credential paths are wired and asserted: the module-managed Secret, a
+  caller-managed one via `redis_auth_token_secret_ref`, and an external Redis
+  with an ACL `redis_username`. The endpoint scheme follows
+  `local.redis_tls_active`, the same local n8n and KEDA read.
+
+  Scrape it through the `prometheus.io` annotations on the pod, or point a
+  ServiceMonitor at the Service. Independent of `n8n_metrics_enabled`: the two
+  expose different things and neither implies the other.
+
+  TLS keeps certificate verification on. Both things that usually break it were
+  checked against the exporter rather than assumed: its image copies a CA
+  bundle in, so the Amazon Root CA that signs ElastiCache certificates is
+  present, and no `REDIS_EXPORTER_TLS_SERVER_NAME` is needed on the
+  module-managed path because `local.redis_host` is the replication group's own
+  AWS endpoint, which its certificate covers. The one case that would need it,
+  an external Redis reached through a friendly CNAME rather than its real
+  hostname, is documented in `redis_exporter_image` and left unwired until
+  someone hits it. Not yet exercised against a live TLS cluster end to end.
+
+- `redis_apply_immediately` is now wired into the default single-node
+  `aws_elasticache_cluster` as well as the replication group. Previously it
+  silently did nothing on the single-node topology, so a `redis_node_type`
+  resize reported "Apply complete" while AWS queued it for the maintenance
+  window, with every following plan wanting the same `node_type` change again
+  until then. Duration of the immediate path depends on the node types: one
+  forced resize measured 41 minutes, a `cache.t3.medium` to `cache.t3.small`
+  change on the single-node topology measured 11 minutes, during which Redis
+  was unavailable for roughly two minutes and n8n's pods went unready and
+  reconnected without restarting.
+
+  The input is also now passed to both ElastiCache resources as an explicit
+  bool rather than `true`-or-`null`. Verified live: `apply_immediately` is
+  Optional+Computed on `aws_elasticache_cluster` and
+  `aws_elasticache_replication_group` and the provider never reads it back,
+  so with the old wiring a deployment that set the input to `true` once and
+  then unset it kept `true` in state with no plan diff, and every later Redis
+  modification skipped the maintenance window silently. An explicit `false`
+  is the only way to turn it back off. **Upgrade note:** deployments created
+  before this release see a one-time in-place `+ apply_immediately = false`
+  on their ElastiCache resource. It is state-only; the provider makes no API
+  call for this attribute on its own, and nothing about the running cache
+  changes.
+
+### Fixed
+
+- **Docs:** the README's Redis in-transit encryption chapter claimed
+  `create_elasticache = false` was "not compatible" with
+  `redis_transit_encryption_enabled` and that the combination was "rejected at
+  plan time". Neither is true, and it has not been true on any released
+  version. `local.redis_tls_active` reads the input directly on both paths, and
+  `check "redis_tuning_requires_module_managed_elasticache"` (`redis.tf`)
+  deliberately omits it from the inputs it rejects on the customer-managed
+  path, saying in its own message that TLS and AUTH posture there are
+  controlled by `redis_transit_encryption_enabled`, `redis_auth_token` and
+  `redis_username`. `examples/customer-managed-redis` sets exactly this
+  combination, and its test asserts the TLS path is what the example exists to
+  exercise. The section now describes the input's actual meaning on that path:
+  a declaration that the caller's endpoint is TLS-only, which wires n8n and the
+  KEDA triggers to speak TLS without the module terminating or verifying
+  anything. `redis_transit_encryption_mode`, which genuinely does not apply
+  there, is called out separately. No behavior change.
+
+## [0.3.0] - 2026-08-13
+
+Minor release per the [stability contract](./README.md#stability--versioning):
+the Terraform CLI floor raised to `>= 1.11` (see **Fixed**, below) is breaking
+for callers on an older CLI, and this range also refactors several resource
+addresses (absorbed by `moved` blocks, but a minor-boundary change under the
+contract regardless). Existing deployments upgrade with a no-op or in-place
+plan throughout, since every address change carries its own `moved` block and
+default changes that affect provisioning (e.g. `db_engine_version`) are
+guarded by `lifecycle.ignore_changes` on the resources that would otherwise
+drift. Pin this module to `~> 0.2.0` to stay on the previous floor and
+defaults, or retype your constraint to `~> 0.3.0` and read the upgrade notes
+under **Changed** and **Fixed**.
+
+### Added
+
+- **Support for n8n's own External Secrets feature**, via four new variables.
+  This is the roadmap's "Bring your own Secrets Manager" item, at the scope it
+  was narrowed to on 2026-08-05, and it concerns *workflow credential* values
+  resolved from a vault at runtime. The module's own secrets (DB password,
+  Redis AUTH token, encryption key, task runner token, licence key) are
+  unaffected and stay Kubernetes Secrets.
+
+  `n8n_external_secrets_enabled` (default `true`) is an opt-*out*: setting it
+  to `false` appends `external-secrets` to `N8N_DISABLED_MODULES`, removing the
+  feature and its Settings UI even under a licence that includes it. Left at
+  the default, no env var is emitted at all and n8n's own behavior applies, so
+  Community deployments, where the feature is inert without the
+  `feat:externalSecrets` entitlement, need not set it.
+  `n8n_external_secrets_update_interval` (default `null`) maps to
+  `N8N_EXTERNAL_SECRETS_UPDATE_INTERVAL`.
+
+  `n8n_external_secrets_aws_enabled` (default `false`) is a separate, opt-in
+  IAM layer: it grants the n8n pod's existing Pod Identity role
+  (`aws_iam_role.s3`) read access to AWS Secrets Manager, so an admin
+  connecting n8n's AWS provider in the UI can choose `authMethod = autoDetect`
+  instead of pasting static IAM user keys. It does nothing for n8n's five other
+  vault providers.
+
+  `n8n_external_secrets_aws_secret_names` is **required and non-empty** when
+  that grant is on, and rejects wildcards. This is deliberate rather than
+  fussy: n8n's AWS provider calls `secretsmanager:ListSecrets` with no name,
+  path, or tag filter and then reads every name it finds, so IAM is the only
+  boundary on what a vault connection can read. An empty list or a `*` would be
+  a silent full-account grant. A `check` block additionally warns when a named
+  secret carries this module's own `ManagedBy = terraform` tag.
+
+  Connecting the vault provider itself remains a manual step in the n8n UI in
+  every case; Terraform cannot create that connection.
+
+- **New `redis_key_prefix` variable** (default `null`) namespaces every Redis
+  key a deployment uses, so two n8n deployments can share one external Redis
+  without interfering with each other. Left at `null`, nothing changes: n8n
+  keeps its own defaults on both prefixes, exactly today's behavior.
+
+  n8n has *two* independent Redis key prefixes, and both have to move together
+  or the split is incomplete. `N8N_REDIS_KEY_PREFIX` (n8n's default `"n8n"`)
+  scopes the scaling-mode pub/sub command channel, `<prefix>:n8n.commands`;
+  `QUEUE_BULL_PREFIX` (n8n's default `"bull"`) scopes Bull's own job-queue
+  keys. This one input sets both. The n8n Helm chart exposes only the second,
+  as `redis.prefix`, so the first is set as a literal `extraEnv` entry.
+
+  The failure this fixes was confirmed live, not inferred: with two
+  deployments pointed at the same `redis_host` (`create_elasticache = false`),
+  activating a workflow on one produced `webhook not registered` on the other,
+  because both were publishing to and consuming from the same unscoped
+  `<prefix>:n8n.commands` channel. Subscribing to that channel directly and
+  matching the `senderId` against pod names confirmed the crossed wires.
+
+  Changing the queue prefix also moves the Redis list KEDA watches, so
+  `scaling.tf`'s worker `ScaledObject` `listName` metadata now tracks it
+  (`"<prefix>:jobs:wait"` / `"<prefix>:jobs:active"`) instead of being
+  hardcoded to `bull:jobs:*`. Without that, setting a prefix would have left
+  KEDA polling an empty list and silently frozen worker autoscaling at its
+  minimum. **Changing this on a live deployment abandons whatever is already
+  queued under the old prefix**: drain the queue first, the same way the Redis
+  topology variables are treated.
+
+- **New `redis_kms_encryption_enabled` variable** (default `false`) encrypts
+  the ElastiCache Redis tier at rest with a module-created Customer Managed
+  KMS Key (`aws_kms_key.redis`). Clears Checkov finding `CKV_AWS_191`.
+
+  Defaults to `false` to preserve the existing standalone
+  `aws_elasticache_cluster`, which Redis OSS cannot encrypt at rest. HA- or
+  TLS-selected replication groups are encrypted with the ElastiCache-managed
+  key; enabling this toggle selects the replication-group topology and uses the
+  module CMK instead.
+
+  `kms_key_id` only exists on `aws_elasticache_replication_group`, not on the
+  default single-node `aws_elasticache_cluster`, so this is a third variable
+  (alongside `redis_high_availability_enabled` and
+  `redis_transit_encryption_enabled`) that independently selects the
+  replication group. Enabling it on a deployment that asks for neither HA nor
+  TLS moves Redis onto the replication group at the same one-node cost, just a
+  different resource type. `kms_key_id` is `ForceNew`, so **flipping this on
+  an existing deployment replaces Redis and drops the queue**, the same trap
+  the other two Redis topology variables document; treat it as a
+  maintenance-window operation and drain the queue first. See README →
+  "Redis in-transit encryption and AUTH" for the full three-variable
+  interaction table.
+
+### Changed
+
+- **`examples/customer-managed-everything` orders n8n after the controllers it
+  installs directly.** The n8n chart renders a KEDA `ScaledObject`
+  unconditionally, and with `install_keda = false` on `module "n8n"` there was
+  no resource for Terraform to infer an ordering edge from, so the release
+  could be applied before KEDA's CRDs existed. The example's `kubernetes` and
+  `helm` providers now read the stand-in cluster resource directly instead of
+  `module.n8n`'s outputs, which is what makes `depends_on = [module.controllers]`
+  declarable rather than a cycle. `modules/controllers/keda.tf` states the
+  contract for anyone else invoking that submodule directly.
+
+- **`N8N_REDIS_KEY_PREFIX` is reserved in `n8n_extra_env`.** `redis_key_prefix`
+  is documented as the single source of truth for the Redis namespace, setting
+  n8n's own prefix, Bull's (`QUEUE_BULL_PREFIX`, already reserved via the
+  `QUEUE_` family) and the KEDA trigger's `listName` together. Without the
+  reservation an `n8n_extra_env` entry could move one of the three on its own,
+  leaving KEDA watching a list nothing writes to.
+
+- **`create_db_kms_key`, `db_logs_kms_key_enabled` and `create_s3_kms_key`
+  replace inferring "bring your own key" from an ARN being null.** The three
+  KMS ARN inputs were each compared against null inside a `count`, which meant
+  `db_kms_key_arn = aws_kms_key.mine.arn`, a key created in the same
+  configuration, failed the plan outright with "The count value depends on
+  resource attributes that cannot be determined until apply". A `string`
+  variable with a static default still arrives unknown if the caller wires a
+  resource attribute into it, so nullness was never safe to gate on. The
+  module now gates on a boolean the caller writes as a literal, leaving the ARN
+  beside it free to be computed. Each boolean carries a `validation` rejecting
+  the incomplete half and a `check` warning on the ignored half, the same
+  three-part shape as every other customer-managed toggle. All three ARN inputs
+  are new in this same unreleased range, so no released configuration is
+  affected; `docs/customer-managed-infrastructure.md` uses the episode as the
+  worked example under "Why a static boolean, not `x == null` inference".
+
+- **Documentation only, no behavior change: three limitations found during
+  live validation of the customer-managed paths are now written down instead
+  of being discovered at apply time.**
+
+  `docs/troubleshooting.md` gains two entries. The first covers the AWS Load
+  Balancer Controller failing with `couldn't auto-discover subnets: ... are
+  tagged for other clusters` when a second n8n stack is deployed into a VPC
+  another deployment already uses: LBC treats another cluster's
+  `kubernetes.io/cluster/<name>=shared` subnet tag as disqualifying rather
+  than shareable, and the fix is to name the subnets explicitly through
+  `ingress_annotations`. The second covers two deployments sharing one
+  external Redis interfering with each other's workflow activation, now
+  fixable with the new `redis_key_prefix` above.
+
+  `docs/customer-managed-infrastructure.md` gains a section on `create_eks =
+  false` + `create_ingress = true`, which today has exactly two paths and not
+  the third one most callers on a shared cluster would reach for: `install_lbc
+  = false` is hard-rejected whenever `create_ingress = true`, with no
+  exception for an existing cluster that already runs a healthy LBC. Recorded
+  as a known limitation with the reasoning, rather than fixed in the same pass
+  as the Pod Identity gating above, since relaxing it changes the module's
+  plan-time validation contract.
+
+  `db_host`'s description now states that `create_database = false` shares the
+  exact database and tables, not just the host: there is no `db_name` input, so
+  the database name is fixed at `n8n_enterprise`. Two deployments pointed at
+  one customer-managed Postgres share one n8n instance's data. The
+  migration/cutover case works; true multi-tenant sharing does not.
+
+  A third `docs/troubleshooting.md` entry, also from live validation: on the
+  `create_eks = false` path, a `terraform plan` with any change pending
+  upstream of the existing cluster defers `data.aws_eks_cluster.existing` to
+  apply time, which leaves the kubernetes provider's `host` unknown and makes
+  it dial `localhost` while refreshing resources already in state, failing
+  the plan with `connect: connection refused`. The entry gives the recovery
+  (apply the upstream change on its own first) and warns explicitly against
+  `-refresh=false`, which defers every data source including
+  `aws_caller_identity` and turns the generated S3 bucket name unknown,
+  planning a destroy and recreate of the bucket holding binary execution
+  data.
+
+- **`db_engine_version` now defaults to `18.4` instead of `16.9`.** n8n's
+  Postgres version policy supports the latest two actively-maintained majors
+  (17 and 18, as of this writing) plus one older, time-limited compatibility
+  major (16); the old default sat in that deprecating compatibility tier
+  rather than on an actively-maintained major. See
+  [#84](https://github.com/n8n-io/terraform-aws-n8n/issues/84).
+
+  An in-place module upgrade leaves existing deployments unchanged:
+  `aws_db_instance.n8n` carries `lifecycle.ignore_changes = [engine_version]`
+  (added so `auto_minor_version_upgrade` drift doesn't get reset on every
+  apply), and that same setting means a new default in the variable does not by
+  itself produce a plan diff on state created under the old default. The new
+  default applies to instances created after this change, including replacement
+  instances. Existing instances stay on whatever `engine_version` is already
+  in state until upgraded deliberately out-of-band. Follow
+  [AWS's major-version upgrade process](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_UpgradeDBInstance.PostgreSQL.MajorVersion.Process.html):
+  validate extensions and application compatibility first, plan for downtime
+  or use a blue/green deployment, and pass `--allow-major-version-upgrade` when
+  using `aws rds modify-db-instance`. Omit `--apply-immediately` to schedule the
+  change for the next maintenance window. After the upgrade, `ignore_changes`
+  means Terraform picks up the new value on refresh rather than fighting it.
+
+- **`db_engine_version` now declares `nullable = false`.** Passing `null`
+  falls back to the default instead of failing the format validation with a
+  misleading "must be of the form MAJOR.MINOR" error.
+
+- **`examples/large`'s Aurora PostgreSQL cluster now pins `engine_version =
+  "18.4"` instead of `16.4`,** for the same reason as the RDS default above.
+  Aurora and other Postgres-compatible derivatives are explicitly out of
+  n8n's official support scope per policy; the example's README and
+  `aurora.tf` now say so. The example is kept for its I/O-Optimized
+  throughput characteristics, which are unrelated to the engine version bump.
+  Same `ignore_changes` caveat applies: this only affects newly-created
+  clusters.
+
+- `create_eks` input (default `true`). Set to `false` to deploy onto an
+  existing EKS cluster (`existing_eks_cluster_name`) instead of the module
+  creating its own cluster, node group, node IAM role, and Pod Identity Agent
+  addon. RDS, ElastiCache, S3, the namespace, and the IAM roles and Pod
+  Identity associations for n8n and any `install_*` controller stay exactly as
+  they were either way; only the cluster and node group underneath them stop
+  being module-managed. Two facts about the existing cluster are checked at
+  plan time: it must be in `vpc_id` (a hard failure, since every security
+  group, subnet, and route this module writes assumes the cluster's ENIs live
+  there), and it must already have the `eks-pod-identity-agent` addon
+  installed (the AWS provider itself fails the plan if it does not, via
+  `data.aws_eks_addon`). A Kubernetes-version mismatch against
+  `kubernetes_version` only warns
+  (`check.existing_eks_cluster_kubernetes_version_matches`), since a control
+  plane one release ahead of or behind is frequently still fine. Everything
+  else, node capacity for the HPA/KEDA maxima, Cluster Autoscaler
+  auto-discovery tags, API server reachability, and naming/identity
+  collisions on a shared cluster, cannot be validated on infrastructure this
+  module does not own, so `existing_eks_cluster_prerequisites_confirmed` is a
+  required, explicit attestation enumerating each one rather than a silent
+  assumption. The EBS CSI addon and default `gp3` `StorageClass` are gated
+  separately, on their own `create_ebs_csi` input (see below), rather than
+  folded into this one. See README.md → "Bring your own EKS cluster".
+
+- `create_ebs_csi` input (default `true`). Set to `false` to skip installing
+  `aws_eks_addon.ebs_csi` and the default `gp3` `StorageClass` (`storage.tf`),
+  e.g. when `create_eks = false` and the existing cluster you are deploying
+  onto already runs its own CSI driver and default StorageClass: a second
+  `aws-ebs-csi-driver` addon install on a cluster that already has one fails
+  outright rather than degrading gracefully. Independent of `create_eks`,
+  since a freshly created cluster never has a CSI driver of its own and
+  should normally leave this at its default.
+  `check.existing_eks_cluster_needs_its_own_storage_toggle` now warns
+  specifically when `create_eks = false` and this is still left at its
+  default, rather than firing on every `create_eks = false` deployment
+  regardless of whether the caller has already opted out. Gated with `count`
+  and a `moved` block, same pattern as `create_eks` itself. This resolves the
+  storage open question the original `create_eks` proposal left undecided.
+
+### Fixed
+
+- **`examples/customer-managed-cluster` tagged its subnets for the wrong
+  cluster name, so the Ingress apply timed out waiting for an ALB.** The
+  example's VPC tagged subnets `kubernetes.io/cluster/<cluster_name>=shared`
+  while the stand-in cluster it creates is named `<cluster_name>-cm`. The AWS
+  Load Balancer Controller auto-discovers subnets by the cluster's real name
+  and treats a subnet tagged for any other name as ineligible ("2 are tagged
+  for other clusters"), so no ALB was ever provisioned and
+  `kubernetes_ingress_v1.n8n`'s `wait_for_load_balancer` failed the apply.
+  Found on a live deployment of the example; the mocked test suite cannot see
+  LBC's server-side discovery. Fixed the same way
+  `examples/customer-managed-everything` already handles it: a
+  `customer_managed_cluster_name` local is now the single source for the
+  cluster's name and both subnet tag keys, so the two cannot drift apart.
+
+- **The stand-in clusters in `examples/customer-managed-cluster` and
+  `examples/customer-managed-everything` no longer orphan a Never-expire
+  control-plane log group on destroy.** Both enable all five
+  `enabled_cluster_log_types` but owned no log group, so EKS auto-created
+  `/aws/eks/<name>-cm/cluster` with "Never expire" retention outside
+  Terraform, and `terraform destroy` left it behind, confirmed live on a
+  destroy of `customer-managed-cluster`. Each example now creates the log
+  group explicitly (365-day retention, `depends_on` from the cluster so EKS
+  cannot race it into existence first), mirroring the module's own
+  `aws_cloudwatch_log_group.eks_cluster` pattern.
+
+- **State migration for every newly `count`-gated resource.** `create_eks`,
+  `create_s3_bucket`, `create_ebs_csi`, `n8n_encryption_key_secret_ref` and
+  `db_password_secret_ref` each put a `count` on resources that were
+  unconditional in every released version, moving them from `.n8n` to
+  `.n8n[0]`, and the `modules/controllers` extraction moved four more into a
+  child module. Eighteen addresses had no `moved` block covering that change,
+  so an upgrade would have planned a destroy and recreate of, among others,
+  the live EKS cluster and node group, the S3 bucket holding n8n's binary
+  execution data, and the Kubernetes Secrets the running pods are mounted
+  against. Four existing blocks were also unreachable, sourcing the EBS CSI
+  addon, IAM role, policy attachment and gp3 StorageClass from a `[0]` index
+  that no released version ever wrote. All of it now resolves from a released
+  state to its current address (`refactoring.tf`).
+
+- **The Load Balancer Controller and Cluster Autoscaler IAM roles and policies
+  are gated with their associations**, on the same `create_eks || install_<x>`
+  predicate, instead of being created unconditionally. Left unconditional they
+  were, on the `create_eks = false` plus `install_<x> = false` path, roles
+  carrying `AWSLoadBalancerControllerIAMPolicy` and the cluster-autoscaler
+  policy that nothing could assume, since the association that binds them to a
+  ServiceAccount is skipped there. Their names are derived from `cluster_name`
+  alone, so two `modules/controllers` calls sharing a cluster also collided on
+  `EntityAlreadyExists` at apply time: `examples/customer-managed-everything`
+  invokes the submodule directly *and* calls `module "n8n"`, whose own
+  controllers call is always instantiated, and is exactly that shape.
+
+- **The Cluster Autoscaler's IAM condition keys on the real cluster name.** The
+  `autoscaling:ResourceTag/k8s.io/cluster-autoscaler/<name>` condition on
+  `SetDesiredCapacity` and `TerminateInstanceInAutoScalingGroup` was built from
+  `cluster_name`, while the chart auto-discovers node group ASGs by
+  `eks_cluster_name`. The two are the same string when the module creates the
+  cluster, and differ on `create_eks = false`, where the autoscaler would come
+  up healthy and silently hold no write permission on any ASG it could see.
+
+- **The AWS Load Balancer Controller webhook failure policy is actually
+  applied.** The module set `webhookConfig.failurePolicy`, which chart 3.5.0
+  does not read; Helm accepts unknown `--set` paths silently, so the webhook
+  stayed on its chart default of `Fail` and could still block Ingress deletion
+  during teardown when LBC pods are unhealthy. The key the chart reads is
+  `webhookConfig.ingressValdationFailurePolicy`, upstream's typo and all.
+
+- **`n8n_external_secrets_aws_enabled` grants `kms:Decrypt`.** An allow-listed
+  secret encrypted with a customer managed KMS key was unreadable: Secrets
+  Manager decrypts as the calling principal, so `GetSecretValue` returned
+  `AccessDenied` no matter how the secret's own policy read. Scoped by a
+  `kms:ViaService` condition rather than a key ARN list, because
+  `DescribeSecret` returns the key as an ID, an alias, an alias ARN or nothing
+  at all, and only one of those is usable in an IAM `Resource`.
+
+- **Minimum Terraform version raised to `>= 1.11`**, from `>= 1.9`, in every
+  `versions.tf`: the module root, `modules/controllers`, and all ten examples.
+  This is a breaking change for anyone pinned below 1.11. Two things forced it.
+  `override_resource`'s `override_during` attribute, which three of the
+  customer-managed examples' test suites need, arrived in 1.11 and is silently
+  ignored before it. And CI had already moved to a single 1.15.8 pin, which
+  left `>= 1.9` as a claim nothing exercised, on a repo that has been bitten
+  before by exactly that kind of untested floor (`check` blocks did not
+  short-circuit `&&`/`||` before Terraform 1.10, a hazard invisible on any
+  newer local CLI). The floor and the CI pin are now consistent, and 1.15.8
+  sits above both. The `check` blocks keep their `guard ? body : true` shape,
+  which is now a consistency convention rather than a correctness requirement;
+  `AGENTS.md` records why, so nobody "simplifies" one back into the form that
+  used to break.
+
+  **Upgrade note.** Per the stability contract in
+  [README.md → Stability & versioning](README.md#stability--versioning), a
+  raised version floor is a minor-boundary change. Nothing in your
+  configuration needs editing: upgrade the Terraform CLI to 1.11 or newer and
+  re-run `terraform init`. On an older CLI, `init` fails immediately with an
+  unsupported-version error rather than planning anything, so there is no
+  half-applied state to recover from. There is no state migration, no resource
+  replacement, and no input or output changed by this.
+
+- **`examples/customer-managed-redis`, `-s3` and `-cluster` declare the
+  Terraform floor their own test suites need.** All three use
+  `override_resource`'s `override_during`, which arrived in Terraform 1.11 and
+  is silently ignored before it, so the documented `terraform test` command
+  failed with a confusing assertion error rather than a version error on any
+  1.9 or 1.10 their `versions.tf` claimed to support.
+
+- **The Load Balancer Controller and Cluster Autoscaler Pod Identity
+  associations are now gated, so `create_eks = false` no longer collides with
+  an association the existing cluster already carries.** Both associations
+  (`modules/controllers/iam.tf`) were fully unconditional, on the deliberate
+  and, for a freshly created cluster, correct reasoning that an
+  externally-installed controller still needs its IAM binding. That reasoning
+  does not survive `create_eks = false`: pointed at an existing cluster whose
+  `aws-load-balancer-controller` ServiceAccount is already bound, e.g. by a
+  previous invocation of this exact module against the same cluster, EKS
+  rejects the second association with `409 ResourceInUseException` and the
+  apply fails. Confirmed live, not inferred.
+
+  The gate is `count = var.create_eks || var.install_<x> ? 1 : 0`, not a bare
+  `var.install_<x>`, which keeps the original fresh-cluster behavior intact:
+  on `create_eks = true` nothing can already be bound, so the association is
+  still created regardless of the toggle. On `create_eks = false`,
+  `install_lbc = false` / `install_cluster_autoscaler = false` is now read as
+  an attestation that the binding already exists there. Existing deployments
+  are unaffected: every one of them has `create_eks = true` or the matching
+  `install_*` toggle at its default `true`, so the gate evaluates true and the
+  association stays exactly where it is. `refactoring.tf`'s `moved` blocks
+  target the new `[0]` addresses.
+
+  `modules/controllers` takes a new `create_eks` input for this, defaulting to
+  `true`. The default matters: that submodule is a documented direct-invocation
+  point for advanced callers (see `examples/customer-managed-everything`), and
+  `true` reproduces its original unconditional behavior, so the new input is
+  additive rather than a breaking change to its contract.
+
+- **`Taskfile.yml`'s `EXAMPLES` list, and the per-example command blocks in
+  `AGENTS.md` and `CONTRIBUTING.md`, had drifted four examples behind the CI
+  matrix.** All three still enumerated only `small`, `medium`, `large`,
+  `cloudflare`, `godaddy` and `split-ingress`, while
+  `.github/workflows/terraform-tests.yml` also runs `customer-managed-redis`,
+  `customer-managed-s3`, `customer-managed-cluster` and
+  `customer-managed-everything`. `task ci` therefore reported green on changes
+  it had never validated, and `CONTRIBUTING.md`'s claim that the documented
+  loop "mirrors the CI matrix exactly" was false. This is not hypothetical: it
+  is how a change to `modules/controllers`' input contract passed a full local
+  run while breaking `examples/customer-managed-everything`, the one root
+  module that invokes that submodule directly. All three lists now match the
+  CI matrix, and `AGENTS.md`'s block is a loop over that list rather than
+  hand-maintained per-example lines (which also fixes a latent bug in it: the
+  lines chained bare `cd examples/<x>` commands that were relative to the
+  previous example's directory, so only the first could ever have run).
+
+- `create_elasticache`, `redis_host`, and `README.md`'s "Bring your own
+  Redis" (now "Customer-managed Redis") section all incorrectly stated that
+  an external Redis requiring AUTH or TLS was "not supported yet." AUTH
+  (`redis_auth_token` / `redis_auth_token_secret_ref`) and TLS
+  (`redis_transit_encryption_enabled`) have both worked on the
+  `create_elasticache = false` path for some time (`local.redis_auth_active`
+  and `local.redis_tls_active` in `locals.tf` are not gated on
+  `create_elasticache`); the docs were simply never updated when that
+  support landed. Corrected in both variable descriptions and the README
+  section, which now also carries a worked example.
+
+- `aws_eks_node_group.n8n` no longer fights the Cluster Autoscaler over
+  `desired_size`. The node group is tagged for autoscaler auto-discovery
+  (`k8s.io/cluster-autoscaler/enabled`), but Terraform still tracked
+  `desired_size` as authoritative. Once the autoscaler moved the live count
+  away from `var.node_desired`, every subsequent plan proposed resetting it
+  back down, and applying that drains live nodes: reported in
+  [#50](https://github.com/n8n-io/terraform-aws-n8n/issues/50) on module
+  0.2.0, an apply
+  during an HPA scale-up event reset `desired_size` from 6 to 3, draining 3
+  nodes mid-rollout and evicting n8n pods. `scaling_config[0].desired_size`
+  is now in the node group's `lifecycle.ignore_changes`, the standard pattern
+  for autoscaler-managed node groups. `node_desired` now only sets the size at
+  creation; its description was updated to say so.
+
+- The module-managed Ingress routed only `/webhook` to the webhook processors.
+  n8n disables five endpoint families on the main pods when
+  `disableProductionWebhooksOnMainProcess` is set, which this module always
+  sets, so `/webhook-waiting`, `/form`, `/form-waiting`, and `/mcp` reached
+  `n8n-main`, where no handler is registered for them. The request then falls
+  through to the editor's single-page-app handler, which answers `200` with the
+  editor HTML, so the caller logs a success and nothing runs. In practice that
+  broke Wait-node resumption, Slack and Telegram human-in-the-loop callbacks,
+  Form Trigger nodes, and MCP Server Triggers. All five prefixes now route to
+  `n8n-webhook-processor`.
+
+  Four of them match `templates/ingress-webhook.yaml` in the upstream Helm
+  chart. `/mcp` does not: the chart omits it, even though n8n registers the live
+  MCP handler in the same block the flag disables
+  (`packages/cli/src/abstract-server.ts`). That looks like a gap in the chart
+  and is worth raising upstream. Upgrade is in place: the plan shows added
+  Ingress paths, no ALB replacement.
+
+  Verified by upgrading a real 0.2.0 deployment rather than by inspection. A
+  0.2.0 cluster was applied, then repointed at this version: the `moved` block
+  reported `kubernetes_ingress_v1.n8n[0]` as `(moved from
+  kubernetes_ingress_v1.n8n)` and `Plan: 0 to add, 2 to change, 0 to destroy`.
+  The Ingress kept its identity and the ALB was not replaced. The two in-place
+  changes are the added path prefixes and the alias record re-reading its ALB
+  target. No other resource planned a replacement across the upgrade.
+
+  This resolves [#54](https://github.com/n8n-io/terraform-aws-n8n/issues/54).
+  The MCP session affinity concern reported alongside the routing gap does not
+  apply to any n8n version this module deploys: n8n stores MCP session IDs in
+  Redis ([n8n#25147](https://github.com/n8n-io/n8n/pull/25147)) and any webhook
+  replica can serve any session. The stale known-limitation notes were removed
+  from README.md and docs/troubleshooting.md, and the split-ingress example's
+  `mcp_single_replica` workaround variable was removed with them.
+
+- Every `helm upgrade` scaled the main, worker and webhook deployments down to 2
+  replicas before their autoscalers climbed back. The chart renders
+  `spec.replicas` unconditionally on all three deployments, from
+  `multiMain.replicas`, `queueMode.workerReplicaCount` and
+  `webhookProcessor.replicaCount`, with no regard for whether an HPA or a KEDA
+  ScaledObject also owns the field. The module passed a constant `2` for all
+  three, so Helm and the autoscaler disagreed on every apply.
+
+  It reset any scale-up, not only a configured floor: a deployment the HPA had
+  taken to 8 under load went back to 2 and had to climb again. It cost most where
+  the floor was highest, since `examples/large` runs a webhook floor of 30 and a
+  worker floor of 20, both of which collapsed to 2 on each apply and then had to
+  be re-scaled while traffic was already arriving. Same class of defect as
+  [#51](https://github.com/n8n-io/terraform-aws-n8n/issues/51): pod count driven
+  by two sources that disagree.
+
+  All three are now wired to their autoscaler's floor
+  (`n8n_main_hpa_min_replicas`, `n8n_worker_keda_min_replicas`,
+  `n8n_webhook_hpa_min_replicas`), so the manifest agrees with the autoscaler on
+  where the deployment rests. Helm's write is a no-op while the deployment sits
+  at its floor.
+
+  This bounds the drop rather than eliminating it, and the distinction matters if
+  you upgrade under load. A deployment the autoscaler has taken above its floor
+  is still written back down to the floor, and still has to climb again: for
+  `examples/large` that is a webhook deployment at 80 dropping to 30 instead of
+  to 2. Bounding it at the floor is the most a caller of this chart can do, since
+  the field is rendered unconditionally and no value omits it, and reading the
+  live replica count back into the plan would make every plan depend on current
+  cluster state. Eliminating it needs the chart to guard `spec.replicas` on
+  whether an autoscaler owns the deployment, which is an upstream change.
+  Deployments resting on the default floors see no change, since those already
+  matched the constant.
+
+  Verified on a live cluster rather than by inspection, because no plan-time test
+  can observe a `helm upgrade`. A 3-node cluster was applied from the previous
+  version with a webhook floor of 5 and a worker floor of 3, then given one
+  unrelated config change to trigger an upgrade. Sampling `spec.replicas` every
+  two seconds through it:
+
+  ```
+     5 samples  webhook=5 worker=3   <- steady state at the configured floors
+     2 samples  webhook=2 worker=2   <- Helm re-asserts spec.replicas=2
+    41 samples  webhook=5 worker=3   <- HPA and KEDA climb back
+  ```
+
+  Webhook capacity dropped 60% and worker 33% mid-upgrade, and `helm get manifest`
+  confirmed the release's stored desired state read `replicas: 2` for all three
+  while the cluster ran 5 and 3. Repointing at this version planned `Plan: 0 to
+  add, 1 to change, 0 to destroy`, an in-place `helm_release` update with no
+  replacement of the ALB, RDS instance, KMS key or any PVC, and moved the stored
+  manifest to 5 and 3. A second, pod-churning upgrade of the same duration as the
+  one that collapsed (1m45s) held every one of 48 samples steady. Both runs had
+  the deployments resting at their floors, which is the case the fix closes; the
+  above-the-floor case described above was not exercised on the cluster.
+
+  A no-op re-apply does **not** show the defect, since Terraform only runs
+  `helm upgrade` when the values change. It takes a real config change or version
+  bump, which is also when it surfaces in practice.
+
+- `db_allowed_cidr_blocks` is now de-duplicated against the always-allowed VPC
+  CIDR. Passing the VPC CIDR explicitly, or repeating an entry, previously
+  produced a security group rule with the same permission twice, which AWS
+  rejects at apply with `InvalidParameterValue: The same permission must not
+  appear multiple times` while the plan looked clean. Verified against the live
+  API before fixing.
+
+- **A caller-supplied `db_kms_key_arn` no longer encrypts the `postgresql` log
+  group.** CloudWatch Logs cannot use a CMK unless that key's policy grants
+  `logs.<region>.amazonaws.com` the `kms:Encrypt`, `kms:Decrypt`,
+  `kms:ReEncrypt*`, `kms:GenerateDataKey*` and `kms:DescribeKey` actions. A
+  centrally-owned key, which is the whole use case for the input, will not
+  carry that statement by default, so `CreateLogGroup` failed with
+  `InvalidParameterException` before the RDS instance was created, leaving a
+  half-built stack. Worse, no AWS provider data source returns a key policy
+  (`data.aws_kms_key` has no `policy` attribute and there is no
+  `aws_kms_key_policy` data source), so the prerequisite cannot be verified at
+  plan time and the failure could not be predicted.
+
+  The log group now resolves through its own local. On the module-managed path
+  nothing changes: the module wrote the CloudWatch Logs statement onto the CMK
+  it created, so the log group stays on that key. On the bring-your-own path
+  the log group falls back to CloudWatch's AWS-managed encryption unless
+  `db_logs_kms_key_arn` is set. A `check` block discloses that fallback on
+  every plan, because "I gave the module my CMK" and "everything the module
+  creates uses my CMK" are different claims and a reviewer will ask which is
+  true. Setting `db_logs_kms_key_arn` silences it.
+
+  Three things about a supplied key *are* checkable and are now checked, for
+  both `db_kms_key_arn` and `db_logs_kms_key_arn`: `key_state` is `Enabled`,
+  `key_usage` is `ENCRYPT_DECRYPT`, and `key_spec` is `SYMMETRIC_DEFAULT`.
+  That covers a mistyped, deleted, disabled, pending-deletion, asymmetric or
+  sign-only key. The describe adds no IAM requirement, since creating an
+  encrypted RDS instance already requires `kms:DescribeKey` and
+  `kms:CreateGrant` of the caller. The key's region is asserted from the ARN
+  string with no API call, so it holds even on paths where the key is unused.
+  `s3_kms_key_arn` deliberately gets no such probe: the module needs no
+  permission on that key, and describing it would invent an IAM requirement
+  that does not otherwise exist.
+
+### Added
+
+- **Customer-managed infrastructure**, consolidated. Every layer this module
+  can provision (EKS, RDS, ElastiCache Redis, S3, the cluster controllers) can
+  also be pointed at infrastructure the caller already runs, following the
+  same `create_<x>` / reference-variable / `validation` shape throughout.
+  Most of these toggles already shipped individually across earlier releases;
+  what's new here is making the pattern discoverable as one thing:
+
+  - A new [`README.md` → "Customer-managed infrastructure"](./README.md#customer-managed-infrastructure)
+    section with a single state-matrix table (layer, toggle, reference
+    inputs) instead of the pattern being scattered across per-variable docs.
+  - A new [`docs/customer-managed-infrastructure.md`](./docs/customer-managed-infrastructure.md)
+    for contributors, documenting the convention itself: why a static
+    boolean rather than `x == null` inference, the checklist for adding a
+    new customer-managed layer, and why the module deliberately does not
+    add `data`-source checks of a caller-supplied resource's security
+    configuration (an AWS API call at plan time that hard-fails for anyone
+    whose credentials can't read that specific resource).
+  - Four new runnable examples,
+    [`examples/customer-managed-redis`](./examples/customer-managed-redis/),
+    [`examples/customer-managed-s3`](./examples/customer-managed-s3/),
+    [`examples/customer-managed-cluster`](./examples/customer-managed-cluster/),
+    and [`examples/customer-managed-everything`](./examples/customer-managed-everything/).
+    The first three each provision a plain-Terraform stand-in for one piece
+    of infrastructure a customer would already have and point the module at
+    it with `create_elasticache = false` / `create_s3_bucket = false` /
+    `create_eks = false`. `customer-managed-redis` also doubles as a
+    runnable demonstration that AUTH and TLS work on the customer-managed
+    Redis path (`redis_auth_token`, `redis_transit_encryption_enabled`),
+    which the module's own docs incorrectly described as unsupported until
+    this release (see Fixed, below). `customer-managed-everything` combines
+    all three stand-ins plus a direct `modules/controllers` invocation, so
+    every layer the module can create is customer-managed at once.
+    `customer-managed-cluster` and `customer-managed-everything` have no
+    full-plan `terraform test` coverage, unlike the other two: the module's
+    own `data.aws_eks_cluster.existing` read cannot be resolved to a known
+    value under `command = plan` with mocked providers once nested inside
+    an example's own `module "n8n"` call, confirmed by direct
+    experimentation rather than assumed. See each example's own
+    `tests/defaults.tftest.hcl` for the full writeup; the module's own
+    `create_eks = false` logic is unaffected and remains covered by the
+    repo root's own test suite.
+  - Terminology: user-facing docs now say "customer-managed" rather than
+    "bring your own"/"BYO" throughout (`create_ingress`, `redis_host`, the
+    two `n8n_*_service_name` outputs, the "Bring your own Redis" and "Bring
+    your own Ingress" `README.md` sections, now "Customer-managed Redis" and
+    "Customer-managed Ingress").
+
+  No variable names, defaults, or behavior changed as part of this: this is
+  a documentation and discoverability consolidation over toggles that
+  already existed. Tracked in [#88](https://github.com/n8n-io/terraform-aws-n8n/issues/88).
+
+- `modules/controllers` submodule. The AWS Load Balancer Controller,
+  Cluster Autoscaler, metrics-server, KEDA and the EBS CSI driver, previously
+  flat root-level resources, now live in a nested submodule that the root
+  module calls by default (`controllers.tf`), so every existing deployment's
+  plan is unchanged: same `install_*`/`create_ebs_csi` variables, same
+  names, same defaults, at the same `module "n8n" { ... }` call site. The
+  point of the extraction is for an advanced caller deploying onto an
+  existing cluster (`create_eks = false`) to be able to invoke
+  `modules/controllers` directly with only the controllers they actually
+  need, instead of the root module's five toggles being the only way in.
+  State-safe: every relocated resource has a `moved` block in
+  `refactoring.tf` chaining from its prior address, so upgrading is a no-op
+  plan for every existing deployment, not a destroy-and-recreate of live
+  Helm releases and IAM roles. The Load Balancer Controller's and Cluster
+  Autoscaler's IAM role, policy and Pod Identity association are all gated
+  together on `create_eks || install_<x>`, rather than on the `install_<x>`
+  toggle alone: a freshly created cluster (`create_eks = true`, the default)
+  gets all three regardless of the toggle, so an externally installed
+  controller still receives its IAM binding, and an existing cluster with the
+  toggle off gets none of them, so nothing collides with an association that
+  cluster may already carry. See the "Cluster controllers" comment above
+  `install_lbc` in `variables.tf`, and the "Fixed" entry below.
+
+- `n8n_encryption_key` input (default `null`, sensitive) overrides the
+  module-generated `N8N_ENCRYPTION_KEY`. Every deployment before this input
+  existed got a fresh `random_id` with no way to supply one, which silently
+  blocked disaster recovery: n8n encrypts stored credentials under this key,
+  so restoring an RDS snapshot into a new stack (a rebuilt cluster, a
+  cross-region standby, any fresh `terraform apply` against the same
+  database) generated a brand-new random key, leaving every credential the
+  restored database already held permanently undecryptable under it. Set this
+  to the original deployment's key, retrieved beforehand with
+  `terraform output -raw n8n_encryption_key`, to keep decrypting the same
+  database's credentials across a restore, a rebuild, or an adoption of this
+  input by a deployment that already has a `random_id`-generated key. Must be
+  exactly 64 hexadecimal characters (32 bytes), the shape `random_id` with
+  `byte_length = 32` has always produced; anything else is rejected at plan
+  time.
+
+  Left `null` (the default), behavior is unchanged: the module generates the
+  key exactly as it always has. Gating `random_id.n8n_encryption_key`'s
+  `count` on this input changes its resource address from `.n8n_encryption_key`
+  to `.n8n_encryption_key[0]`; a `moved` block in `refactoring.tf` absorbs
+  that, so upgrading onto this input without setting it is a no-op, verified
+  by `terraform plan` rather than by inspection.
+
+  **This is not a rotation mechanism.** n8n's own docs describe
+  `N8N_ENCRYPTION_KEY` as an instance master key that is set once and never
+  changes; a separate data encryption key, stored in the database and itself
+  encrypted by this one, is what n8n's own key-rotation feature
+  (`N8N_ENV_FEAT_ENCRYPTION_KEY_ROTATION`, a one-way operation with no
+  rollback) actually rotates. Setting this variable to a value other than the
+  one a database's existing credentials were encrypted under does not migrate
+  or re-encrypt anything: it just makes every one of those credentials
+  permanently unreadable, with no recovery path on n8n's side. The only
+  supported uses are a first deployment against an empty database, or
+  restoring the *exact original* key into a rebuilt stack pointed at a
+  database that already holds credentials encrypted under that same key.
+
+  There is deliberately no `check` block for this input. What separates the safe
+  uses from the destructive one is what the target database already holds, which
+  no Terraform expression can read, and the one plan-time proxy available turned
+  out to be backwards: warning whenever the input met `create_database = false`
+  fired on the *documented* use (`aws_db_instance.n8n` takes no
+  `snapshot_identifier`, so restoring a database into a rebuilt stack means
+  restoring outside the module and pointing at it) while staying silent on the
+  likeliest real mistake (editing the value on a live `create_database = true`
+  deployment whose credentials are already encrypted under the generated key,
+  which plans clean and destroys all of them). The guidance is on the variable,
+  the `n8n_encryption_key` output, and in README.md instead.
+
+- `redis_transit_encryption_enabled` and the new `redis_auth_token` input now
+  also apply on the external-Redis path (`create_elasticache = false`),
+  closing a gap left by the Redis BYO hook: that path previously required an
+  unauthenticated, plaintext endpoint outright, rejected at plan time if
+  `redis_transit_encryption_enabled` was set alongside it. Both inputs now
+  describe properties of the caller's own Redis instead of a migration lever
+  on infrastructure the module manages: `redis_transit_encryption_enabled =
+  true` declares that the supplied `redis_host` speaks TLS (the module does
+  not verify this: getting it backwards either way is a connection failure,
+  not a security hole), and `redis_auth_token` (sensitive, default `null`)
+  supplies the AUTH credential for a Redis that requires one. Either, both,
+  or neither may be set independently, since a plain external Redis can
+  require AUTH without TLS, unlike ElastiCache. Both are wired into n8n and
+  KEDA identically to the module-managed path: a Kubernetes Secret referenced
+  by name, never inlined into the Helm release values or the ScaledObject
+  manifest.
+
+  `redis_transit_encryption_mode` and `redis_apply_immediately` remain
+  properties of the module-managed replication group specifically and do not
+  reach the external path; the existing
+  `redis_tuning_requires_module_managed_elasticache` check now also warns on
+  `redis_transit_encryption_mode`, and a new
+  `redis_auth_token_requires_external_redis` check warns when
+  `redis_auth_token` is set while `create_elasticache = true` (ignored, the
+  module generates and manages its own token there and cannot substitute a
+  caller-supplied one on infrastructure it owns).
+
+  On the module-managed path, nothing changes: `redis_tls_active` still
+  requires `create_elasticache = true` to mean anything, the module still
+  generates and rotates its own AUTH token, and `redis_transit_encryption_mode`
+  /`redis_apply_immediately` still drive the same three-apply migration.
+  Verified at plan time across every combination (TLS only, AUTH only, both,
+  neither) on the external path, and that the full existing module-managed
+  test suite (HA, TLS, AUTH, and the staged migration) still passes unchanged.
+
+- `n8n_image_repository` input (default `null`) points the Helm release at a
+  custom n8n application image instead of the chart's
+  `docker.n8n.io/n8nio/n8n`. The motivating case is community packages: n8n
+  installs them onto the pod's ephemeral filesystem, so keeping UI-installed
+  nodes across reschedules currently means
+  `n8n_reinstall_missing_packages = true`, an npm install on every pod boot that
+  a large dependency tree turns into a CPU- and memory-heavy rollout
+  ([issue #52](https://github.com/n8n-io/terraform-aws-n8n/issues/52)). Baking
+  the packages into the image removes boot-time installs entirely. Repository
+  and tag stay separate inputs, merged into the Helm values key by key, so
+  setting one leaves the other on the chart default; a tag or digest inlined
+  into the repository is rejected at plan time, since the chart appends the tag
+  itself. See
+  [issue #53](https://github.com/n8n-io/terraform-aws-n8n/issues/53) and
+  README → Custom n8n images.
+
+  With `n8n_image_pull_secrets` left empty, the image has to be pullable by the
+  node group's IAM role (ECR in the same account is, via the
+  `AmazonEC2ContainerRegistryReadOnly` policy the module already attaches) or
+  be public. See `n8n_image_pull_secrets` below for anything else.
+- `n8n_task_runner_image_tag` input (default `null`) pins the tag of the task
+  runner sidecar image (`n8nio/runners`). The chart derives that tag from the
+  n8n application image's tag, which breaks as soon as the application tag is
+  not a published n8n version: with `n8n_image_tag = "2.27.4-mypackages"` the
+  sidecar resolves to `n8nio/runners:2.27.4-mypackages`, which does not exist,
+  and every main and worker pod stays in `ImagePullBackOff`. Task runners are
+  enabled by default, so a custom image is effectively unusable without this.
+  Leave it `null` to keep the chart's inheritance.
+- `n8n_custom_extensions_path` input (default `null`) maps to
+  `N8N_CUSTOM_EXTENSIONS` on all three pod types, which is what makes nodes
+  baked into a custom image load at all. A plain `npm install` into the image's
+  `node_modules` does not: n8n dropped global `node_modules` loading in 1.0 (v10
+  migration guide), and `packages/cli/src/load-nodes-and-credentials.ts` scans
+  only `n8n-nodes-base`, `@n8n/n8n-nodes-langchain`, and the custom directories
+  at startup. Without this input, `n8n_image_repository` alone gets a custom
+  image onto the pods but leaves its nodes invisible.
+
+  Two validations encode failure modes found in the n8n `2.34.0` loader and the
+  pinned chart. A path under `/home/node/.n8n` is rejected: the chart mounts a
+  volume there on the main deployment only, and the module leaves
+  `persistence.enabled` at the chart default, so an `emptyDir` hides whatever
+  the image baked in on mains while workers and webhook processors still see it.
+  A path containing `;` is rejected: n8n splits the variable on it, and since
+  every custom directory is registered under the same `CUSTOM` key with each
+  overwriting the last, extra directories are silently dropped rather than
+  merged. A path must also be canonical, since both of those rules are string
+  comparisons and `/home/node//.n8n/custom` would otherwise slip past them. A
+  `check` block warns when the path has nothing behind it: neither a custom
+  image nor an `n8n_extra_volume_mounts` entry covering it.
+
+  Known limitation, documented rather than fixed: nodes loaded this way are
+  registered as `CUSTOM.<node>` instead of `<npm-package>.<node>`, because
+  `postProcessLoaders` qualifies every type with the loader's package name and
+  the custom loader's is the literal `CUSTOM`. Workflows built against a
+  UI-installed copy of the same package will not resolve, so this suits new
+  deployments rather than migrating an instance already using community nodes.
+- Three plan-time `check` blocks for image and tag combinations that are
+  accepted but almost certainly not intended: `n8n_image_repository` without
+  `n8n_image_tag` (the chart appends its own `stable`, which private registries
+  rarely publish), a custom repository and tag with task runners enabled but no
+  `n8n_task_runner_image_tag` (the ImagePullBackOff case above), and
+  `n8n_task_runner_image_tag` set while `n8n_task_runners_enabled = false`
+  (silently inert). All warn rather than fail, since none can be decided with
+  certainty from the inputs alone. Pinning only `n8n_image_tag`, the common
+  case, trips none of them.
+- `n8n_image_pull_secrets` input (default `[]`) names existing
+  `kubernetes.io/dockerconfigjson` secrets in the namespace, so a custom image
+  can come from a private registry rather than only a public one or
+  same-account ECR. The pinned chart renders `imagePullSecrets` nowhere, not on
+  the pod spec and not on the ServiceAccount, so the module reaches them the
+  way the chart itself documents: a non-empty list makes it create the
+  ServiceAccount with the secrets attached and pass
+  `serviceAccount.create = false`. That account is named `n8n-enterprise-pull`
+  rather than the chart's `n8n-enterprise`, so turning the input on for a live
+  deployment creates it alongside the one Helm still owns instead of colliding
+  with it; the S3 Pod Identity association follows whichever name is in play.
+  Reverting to `[]` hands the account back to the chart in one apply. The
+  module takes secret names, never credentials, so no registry password lands
+  in Terraform state. A `check` block warns when secrets are set without
+  `n8n_image_repository`, since the chart's own images need none.
+
+  Cross-account ECR should not use this: its authorization tokens expire after
+  12 hours, so a pull secret holding one is stale before the next apply. Add
+  the node group role to the source registry's repository policy instead. The
+  new `node_group_role_arn` output is the principal to name there.
+- `n8n_extra_volumes` and `n8n_extra_volume_mounts` inputs (both default `[]`)
+  map to the chart's `extraVolumes` and `extraVolumeMounts` on main, worker and
+  webhook-processor pods, which makes a ConfigMap, Secret or ReadWriteMany
+  claim an alternative to rebuilding an image for every community-package
+  change. A volume takes a name and exactly one source (`config_map`, `secret`
+  or `persistent_volume_claim`), and the inputs are typed rather than raw chart
+  YAML so that plan time can reject what Kubernetes would refuse at admission:
+  a mount naming a volume that was never declared, the chart's reserved `data`
+  and `task-runner-config` names, a mount at `/home/node/.n8n` (where the chart
+  already mounts `data`), repeated names or paths, and a non-canonical or
+  trailing-slash path. `default_mode` is an octal string rather than a number,
+  because Terraform reads `0644` as decimal `644`, which is octal `1204`. A
+  `check` block warns about a declared volume that nothing mounts, which
+  Kubernetes accepts silently.
+
+  `persistence` is deliberately not exposed. Its PVC defaults to
+  `ReadWriteOnce`, which cannot serve the two main replicas this module runs
+  (let alone the HPA above them), and it never reaches workers or webhook
+  processors, so nodes kept there would load on some pod types and not others.
+- `n8n_community_packages_registry` input (default `null`) maps to
+  `N8N_COMMUNITY_PACKAGES_REGISTRY`, so community packages can be installed
+  from a private npm mirror rather than `registry.npmjs.org`, which helps when
+  egress to public npm is blocked or packages are vendored internally. When
+  `null` the env var is omitted entirely and n8n's own default applies. Confirm
+  the entitlement before setting this: n8n gates a non-default registry on the
+  `COMMUNITY_NODES_CUSTOM_REGISTRY` feature rather than on holding a license
+  key, so an instance licensed without it has community-package installs throw
+  `FeatureNotLicensedError` instead of falling back to the public registry.
+
+  Upgrade note: the env var name is now reserved. An existing `n8n_extra_env`
+  entry named `N8N_COMMUNITY_PACKAGES_REGISTRY` is rejected at plan time and
+  must move to the new input. The companion
+  `N8N_COMMUNITY_PACKAGES_AUTH_TOKEN` is deliberately left unmanaged (it is a
+  credential, and `config.extraEnv` renders into the Helm release and Terraform
+  state in plaintext) and stays settable through `n8n_extra_env`.
+- Plan-time warning when the autoscaler ceilings, the per-pod CPU requests, and
+  the node group are out of step. `scaling.tf` models the CPU arithmetic and the
+  `autoscaling_maxima_fit_node_group_capacity` check reports the numbers when the
+  three pod families at their maxima cannot fit in `node_max` ×
+  `node_instance_type`. The demand side sums the main, worker and webhook
+  ceilings, counting task runner sidecars on main and worker pods only, since the
+  chart adds no sidecar to webhook processors. The supply side discounts each
+  node's vCPU by the EKS kubelet reservation, the `aws-node` and `kube-proxy`
+  DaemonSets, and this module's cluster add-ons.
+
+  A `check` block, so it never fails a plan: the model is an approximation, and
+  staging higher ceilings before raising `node_max` is legitimate. vCPU is
+  derived from the instance size rather than read from
+  `data.aws_ec2_instance_type`, because a `check` whose condition is unknown at
+  plan is a hard error rather than a warning and a data source read is exactly
+  what Terraform can defer to apply. An advisory hint must not be able to break
+  a plan. Verified against `ec2:DescribeInstanceTypes` across all 1,150 types
+  offered in eu-west-1: exact for 995, silent for the 104 bare-metal sizes,
+  over-counted on 48 (which costs a warning rather than raising a false one), and
+  under-counted on 3 legacy types that can warn a hair early. New section in
+  README.md, "Sizing autoscaling against node capacity", documents the
+  arithmetic.
+
+  The supply-side constants are the requests these workloads declare on a cluster
+  this module builds, not the figures the upstream charts document: 180m per node
+  for the `aws-node`, `kube-proxy` and `ebs-csi-node` DaemonSets, and 720m once
+  for CoreDNS, metrics-server, KEDA and `ebs-csi-controller`.
+  `ebs-csi-node-windows` is excluded because it reports
+  `desiredNumberScheduled = 0` on a Linux node group. The EKS kubelet reservation
+  is modelled from the AMI's own curve, with t3.xlarge reporting 3,920m
+  allocatable.
+
+  Checked against the real scheduler rather than by inspection, by driving a
+  webhook HPA past capacity on a 3-node cluster. The model predicted 10,500m
+  available; the scheduler placed 10,200m and left 21 pods `Pending` with `0/3
+  nodes are available: 3 Insufficient cpu` while the Cluster Autoscaler sat at
+  `node_max`, which is the failure #51 reports. The 300m residue is bin-packing
+  fragmentation, which no request-based model can represent, so read the warning
+  as a bound rather than a prediction.
+
+- Validation rejecting an autoscaler floor above its own ceiling, for all three
+  pod families. Kubernetes rejects an HPA whose `minReplicas` exceeds its
+  `maxReplicas` and KEDA does the same for a ScaledObject, so this previously
+  failed partway through an apply. Lowering the two default ceilings above makes
+  the combination reachable for a caller who changes nothing, which is why the
+  check is at the variable boundary: the error names both inputs and their values
+  before anything is sent to the cluster. A floor equal to its ceiling stays
+  valid, since that is how you pin a fixed-size deployment.
+
+- `n8n_webhook_hpa_scale_up_stabilization_window_seconds` input (default `0`,
+  matching the Kubernetes API's own default) exposes
+  `behavior.scaleUp.stabilizationWindowSeconds` on the module-managed
+  `kubernetes_horizontal_pod_autoscaler_v2.n8n_webhook`. Lets a caller absorb a
+  short boot-time CPU spike (for example from
+  `n8n_reinstall_missing_packages = true`) without an immediate scale-up. A new
+  `webhook_resources_sized_for_reinstall_missing_packages` plan-time check warns
+  when `n8n_reinstall_missing_packages = true` and the webhook processor's
+  CPU/memory requests and limits are below the values known to survive it in
+  production. See [issue #52](https://github.com/n8n-io/terraform-aws-n8n/issues/52)
+  and `docs/troubleshooting.md`.
+
+- `alb_ssl_policy` input (default `"ELBSecurityPolicy-TLS13-1-2-2021-06"`) maps
+  to the `alb.ingress.kubernetes.io/ssl-policy` annotation on the
+  module-managed Ingress. Previously the HTTPS listener's TLS negotiation
+  policy fell back to the AWS Load Balancer Controller's own default, which is
+  not pinned by the module and can drift as AWS changes it. Operators with a
+  compliance baseline (TLS 1.2 minimum, or TLS 1.3-only) can now set any
+  AWS-published ELB security policy name without forking the module; the
+  default pins a current, modern policy so the negotiated policy is explicit
+  rather than implicit. Ignored when `create_ingress = false`, or when
+  `ingress_annotations` sets the same annotation directly (last write wins;
+  the module now warns when that happens, mirroring the existing
+  `ingress_scheme` conflict check). See
+  [issue #43](https://github.com/n8n-io/terraform-aws-n8n/issues/43).
+
+  Upgrade note: this changes runtime behavior for existing deployments. The
+  AWS Load Balancer Controller's own default when the annotation is unset is
+  `ELBSecurityPolicy-2016-08`, which permits TLS 1.0/1.1 and weaker ciphers.
+  The first apply after upgrading sets the annotation explicitly and raises
+  the ALB's negotiated floor to TLS 1.2 (with TLS 1.3 preferred) via
+  `ELBSecurityPolicy-TLS13-1-2-2021-06`. This is an in-place annotation update
+  on the existing Ingress/ALB (no replacement), but it can reject handshakes
+  from clients that only speak TLS 1.0/1.1. Set `alb_ssl_policy` to your
+  current effective policy (or to `ELBSecurityPolicy-2016-08` to keep prior
+  behavior verbatim) if you need to defer this change.
+- `alb_inbound_cidrs` and `alb_inbound_prefix_list_ids` inputs (both default
+  `[]`) restrict which sources reach the module-managed ALB, rendered into
+  `alb.ingress.kubernetes.io/inbound-cidrs` and
+  `alb.ingress.kubernetes.io/security-group-prefix-lists`. Empty lists omit the
+  annotations entirely, so the AWS Load Balancer Controller default of
+  `0.0.0.0/0` still applies and no existing deployment sees a plan diff. Use
+  them to reach the editor UI and REST API only from known networks (corporate
+  egress ranges, a VPN pool, partner prefixes) while still terminating on a
+  public ALB. This narrows a public ALB and is not equivalent to
+  `ingress_scheme = "internal"`, which moves the ALB off the public internet
+  entirely; the two compose. See
+  [issue #42](https://github.com/n8n-io/terraform-aws-n8n/issues/42).
+
+  The restriction covers the whole ALB rather than individual paths, and the
+  module-managed ALB serves the webhook prefixes alongside the editor UI, so it
+  blocks inbound production webhooks from third-party senders too. Use these
+  inputs when nothing external calls in, or when every sender sits on a known
+  range; to lock down the editor while keeping webhooks public, run the two-ALB
+  topology in `examples/split-ingress` instead. Both inputs are documented with
+  that blast radius spelled out.
+
+  `alb_inbound_cidrs` is IPv4 only, matching the ALB the module builds: it
+  leaves the controller's default `ipv4` address type in place, so an IPv6 rule
+  could never match a client, and a dualstack ALB needs IPv6 subnet CIDRs this
+  module does not create. It also rejects an IPv4 block with host bits set
+  (`203.0.113.5/24`), which Terraform and the controller both accept and EC2
+  rejects when the security group rule is built, well after a clean apply. Three
+  plan-time warnings cover the ways a restriction can silently not exist:
+  setting the same annotation through `ingress_annotations`, which is merged
+  last and still wins; setting `alb.ingress.kubernetes.io/security-groups`,
+  which makes the controller ignore both restrictions because the caller then
+  owns the security group; and setting either input alongside
+  `create_ingress = false`, where the module has no Ingress to annotate.
+
+  A fourth override path gets documentation rather than a warning: an
+  `IngressClassParams` that sets `spec.inboundCIDRs` or `spec.prefixListsIDs`
+  replaces the annotation outright, per field. It cannot reach the
+  module-managed Ingress, which carries the legacy `kubernetes.io/ingress.class`
+  annotation; the controller matches that first and never loads the IngressClass
+  or its params. Caller-owned Ingresses that set only `spec.ingressClassName`,
+  including both in `examples/split-ingress`, are exposed.
+  `docs/troubleshooting.md` gains an entry with the `kubectl` and `aws` commands
+  to diagnose an ALB that answers everyone despite a clean apply, and to verify
+  against the security group the controller owns rather than against the
+  annotation.
+
+  Live verification also surfaced a quota hazard on
+  `alb_inbound_prefix_list_ids`: a security group rule referencing a managed
+  prefix list counts against the rules-per-security-group quota (default 60,
+  `L-0EA8095F`) by the list's max-entries weight, once per listen port, and the
+  module's ALB listens on 80 and 443. A list too heavy to fit (the AWS-managed
+  CloudFront origin-facing list weighs 55, needing 110 rules by itself) takes
+  the ALB
+  offline for every source after a clean apply: the controller revokes the
+  existing rules first, fails with `RulesPerSecurityGroupLimitExceeded`, and
+  leaves the security group with no ingress rules at all. The input's
+  description spells out the arithmetic instead of suggesting AWS-managed
+  lists, and `docs/troubleshooting.md` gains an entry with the diagnosis and
+  recovery.
+
+  Behaviour above was verified against a live deployment on LBC v3.5.0 rather
+  than from the controller source alone, including that the restriction covers
+  port 80 as well as 443, that CIDRs and prefix lists are a union, that the
+  controller reverts hand-edits to the security group it manages so recovery
+  from a lockout is an apply rather than a console fix, and that a caller-owned
+  `security-groups` annotation leaves the restriction unapplied.
+
+  `alb.ingress.kubernetes.io/inbound-cidrs` set through `ingress_annotations`
+  keeps working and keeps winning: it was the documented way to do this before
+  these inputs existed. Delete the annotation when migrating, or the stale value
+  continues to apply.
+
+  `examples/split-ingress` predates these inputs and restricts its internal
+  admin ALB with its own `admin_allowed_cidr_blocks`, since it owns its
+  Ingresses and the module inputs do not reach them. It now enforces the same
+  no-host-bits guard, which it was missing: it accepted `10.20.0.5/16` and left
+  EC2 to reject the rule after a clean apply. Its exposure to the
+  `IngressClassParams` override is the reverse of the module's, so the
+  troubleshooting entry covers both call sites in one place rather than
+  repeating the explanation per variable.
+
+- `n8n_execution_data_storage_mode` input (default `"database"`, accepts
+  `"s3"`) maps to `N8N_EXECUTION_DATA_STORAGE_MODE`, the second S3 offload mode
+  n8n added in 2.27 ([n8n#32226](https://github.com/n8n-io/n8n/pull/32226)).
+  With `"s3"` the data of each new execution is written to the module's existing
+  S3 bucket as
+  `workflows/{workflowId}/executions/{executionId}/execution_data/bundle.json`
+  instead of into PostgreSQL. Execution-data writes are usually the dominant
+  write load on the n8n database at volume, so this is the main lever for
+  relieving RDS pressure in the queue-mode topology this module deploys.
+
+  Nothing new is provisioned: the bucket, IAM policy, Pod Identity role, and
+  `N8N_EXTERNAL_STORAGE_S3_*` connection already exist for binary data and are
+  reused as-is. The pinned Helm chart has no value for this (its `s3.storage`
+  block covers binary data only), so the env var goes through
+  `config.extraEnv`, which reaches main, worker, and webhook-processor pods, as
+  the n8n docs require in queue mode. Requires n8n >= 2.27 (pin
+  `n8n_image_tag`) and an Enterprise license carrying `feat:executionDataS3`,
+  which is a distinct entitlement from the `feat:binaryDataS3` the module's
+  always-on binary data offload relies on; n8n refuses to start in `s3` mode
+  without it. There is no
+  backfill, and switching modes is non-destructive in both directions.
+  `"filesystem"`, valid in n8n itself, is rejected: pod filesystems are
+  ephemeral and unshared here. Default `"database"` emits no env var at all, so
+  this is a no-op diff for existing deployments. Resolves
+  [issue #47](https://github.com/n8n-io/terraform-aws-n8n/issues/47).
+
+  **Upgrade note (breaking):** the env var name is now reserved. Unlike the
+  other names the module took over, this one was *not* previously blocked by the
+  `n8n_extra_env` guard: it matches none of the guard prefixes and was absent
+  from the exact-match list, so callers could and did opt into `s3` mode through
+  the escape hatch. Those configurations now fail variable validation at plan
+  time and must move the value to `n8n_execution_data_storage_mode`. The
+  behaviour is identical once moved, and the error message names the input, but
+  this makes the change a minor-version boundary under
+  [Stability & versioning](./README.md#stability--versioning), not a patch.
+
+  A plan-time `check` block warns when the mode is `"s3"` while `n8n_image_tag`
+  is pinned below 2.27. Older versions ignore the env var outright: pods start
+  clean and execution data silently keeps going to PostgreSQL.
+
+  Note the durability trade-off, documented in the README: `"s3"` moves
+  execution data off RDS, which this module gives 7 days of automated backups
+  and point-in-time recovery by default (`db_backup_retention_period`), and onto
+  a bucket with no versioning, no backups, and `force_destroy = true`. A
+  `terraform destroy` therefore takes execution history with it, and there is no
+  recovery path. That was already true of binary attachments; `"s3"` extends it
+  to execution history.
+
+  Documented alongside it: the module still creates **no** S3 lifecycle
+  configuration, and once execution data shares the bucket it cannot safely
+  create one. Binary data (`.../binary_data/{fileId}`) is pruned *only* by S3,
+  because n8n delegates it; execution data (`.../execution_data/bundle.json`)
+  is pruned by n8n itself and a lifecycle rule can delete bundles it still
+  references. The two cannot be separated by a rule, either: S3 lifecycle
+  filters match a literal key prefix with no wildcards, both layouts share
+  `workflows/{wf}/executions/{exec}/`, and n8n tags neither object. See the new
+  "Execution data in S3" section in `README.md` for the trade-off a caller has
+  to pick between.
+
+  All six examples expose the input as a passthrough, each left at `"database"`
+  so they apply unchanged. `large` has the most execution-data volume, but the
+  least room for it is at the bottom: `small`, `cloudflare`, `godaddy` and
+  `split-ingress` all run `db.t3.small` on 50 GB of gp2 with a 150 IOPS
+  baseline, against Aurora I/O-Optimized with no IOPS ceiling at the top tier.
+  Every example gains a test rejecting `"filesystem"`; the three that can run a
+  full mocked plan (`cloudflare`, `godaddy`, `split-ingress`) also assert the
+  `"database"` default.
+- `n8n_redis_timeout_threshold` input (default `null`) exposes
+  `QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD`, the budget n8n spends trying to reach
+  Redis before calling `process.exit`. `null` leaves the chart's 10000 in place
+  and emits no `redis.timeout` key at all, so existing releases see no Helm
+  diff. Raise it when running `redis_high_availability_enabled = true` and you
+  would rather n8n rode a failover out than restarted.
+
+  This closes out the open question from the high availability work, where
+  raising the threshold to 30s appeared to do nothing but delay the exit. It was
+  not a stale-address bug in ioredis, which re-resolves DNS on every reconnect
+  attempt and was confirmed recovering on a different IP without restarting.
+  n8n simply never sets ioredis's `connectTimeout`, so it stays at 10s, and a
+  connect to a demoted primary hangs for that full 10s before failing. Each
+  failed attempt spends ~11.1s of the budget, making the threshold effectively
+  quantized to 11.1s / 33.2s / 66.4s for settings of 10s / 30s / 60s.
+
+  Against a 25 second outage, a 30s threshold fires at 43.4s and the connection
+  would have returned at 44.5s: it exits **1.1 seconds early**.
+
+  Confirmed against a real ElastiCache failover at `60000`: no container
+  terminated, and every pod logged `Recovered Redis connection` instead of
+  exiting. n8n's own counter showed the predicted quantum on live AWS (samples
+  18.1s, 29.1s, 40.1s, gaps of 11.1s and 11.0s), so a 30s threshold would have
+  exited about 11 seconds before recovery. The real endpoint stayed stale for
+  **48 seconds**, roughly double the worst case modelled locally, because
+  CoreDNS caching and the endpoint TTL stretch the window past the promotion
+  itself. 60000 cleared that with ~20s of headroom, from one observed failover,
+  so the README presents it as a good default rather than a guarantee.
+
+- `redis_transit_encryption_enabled` input (default `false`) puts the
+  ElastiCache queue backend behind TLS and an AUTH token. The default preserves
+  the module's network-trust posture, Redis in private subnets behind a
+  VPC-only security group, so callers who leave it alone get no plan diff at
+  all. Callers who want credential-based Redis security flip one switch instead
+  of forking the module. Resolves
+  [#41](https://github.com/n8n-io/terraform-aws-n8n/issues/41).
+
+  It shares the `aws_elasticache_replication_group` that
+  `redis_high_availability_enabled` introduced, for an unrelated reason:
+  `auth_token` does not exist on `aws_elasticache_cluster`, and AWS further
+  requires transit encryption to be on before AUTH can be enabled at all. So
+  **either** variable alone is enough to move a deployment off the default
+  cluster resource, and the two are independent once there: encryption leaves
+  the cache single-node, and availability leaves the endpoint plaintext. All
+  four combinations are pinned by tests, and the both-on combination is
+  confirmed on a live cluster.
+
+  Because both features land on one resource with one identifier
+  (`<cluster_name>-redis-rg`), enabling the second one later plans as a
+  modification of the replication group already in place rather than a
+  replacement. The encrypted-to-HA direction was verified live and exposed a
+  staged provider workflow: the first apply raises the node count through
+  `IncreaseReplicaCount` and returns with automatic failover still disabled. A
+  fresh plan and apply enables failover; with `redis_apply_immediately = false`
+  that second change waits for the maintenance window, while `true` activates
+  it immediately. The README now documents the full sequence. After activation,
+  a forced failover promoted the replica in 22 seconds, authenticated Redis
+  probes recovered after approximately 26 to 31 seconds, `/healthz` stayed
+  available, and all n8n pods kept their UIDs with zero restarts at a 60,000 ms
+  reconnect threshold.
+
+- `redis_transit_encryption_mode` (default `"required"`) and
+  `redis_apply_immediately` (default `false`) make **adding TLS to an existing
+  replication group** a supported migration rather than a failed apply. AWS
+  refuses a direct plaintext-to-encrypted transition and refuses an AUTH token
+  until the mode is `required`, so `redis_transit_encryption_enabled` on its own
+  plans clean and then fails. `preferred` accepts TLS and plaintext on the same
+  endpoint, which is what makes the transition rideable.
+
+  Both defaults preserve existing behaviour exactly. `apply_immediately` is
+  written as `null` rather than `false` so no deployment already on a
+  replication group sees a plan diff, and `"required"` is what a first-time
+  create wants, so TLS and the token still arrive together in one apply.
+
+  The three-step migration was run end to end against a live ElastiCache
+  replication group with a client connection held open throughout, and **no step
+  interrupted service**: `preferred` took 17m27s with 1198 consecutive replies
+  on the held-open plaintext connection and zero errors; `required` took 8m18s
+  in a single Terraform apply, closing plaintext 131 seconds in, by which point
+  the pods were already on TLS; the final token rotation took seconds. Step
+  three is not optional, because ElastiCache introduces a first token with its
+  `ROTATE` strategy and that keeps the previous credential valid, which for a
+  group that had no token means unauthenticated connections keep working until a
+  second rotation. See README → "Adding TLS to an existing replication group"
+  for the sequence and the measurements.
+
+  The module generates no AUTH token, publishes no Secret and sets no
+  `passwordFromEnv` on the KEDA triggers while the mode is `preferred`, matching
+  what AWS will accept. A `check` block warns on every apply for as long as a
+  deployment stays there, since `preferred` leaves Redis reachable unencrypted
+  and unauthenticated from anywhere in the VPC.
+
+  **Enabling this on a default deployment replaces Redis**, since the cluster
+  and the replication group are different resource types. Every job queued at
+  that moment is lost. Drain workers and pick a maintenance window. Upgrading
+  the module *without* touching the variable does **not** replace anything: the
+  `moved` block in `refactoring.tf` absorbs the `count` on
+  `aws_elasticache_cluster.n8n`.
+
+  The generated token respects ElastiCache's constraints (16-128 chars, with
+  `! & # $ ^ < > -` the only permitted non-alphanumerics) and is published two
+  ways: as a Kubernetes secret the chart mounts as `QUEUE_BULL_REDIS_PASSWORD`
+  on main, worker and webhook processor, and as a new sensitive
+  `redis_auth_token` output (`terraform output -raw redis_auth_token`).
+
+  Everything above describes the module-managed path. `create_elasticache =
+  false` was initially rejected outright alongside this flag, on the grounds that
+  the module cannot put a token on a Redis it does not manage: true, but it left
+  a caller with their own TLS-only or authenticated Redis unable to use the BYO
+  hook at all. Later in this same release the external path gained its own
+  meaning for this flag plus a `redis_auth_token` input; see the
+  `redis_transit_encryption_enabled` / `redis_auth_token` entry above for what it
+  does there.
+
+- **Worker autoscaling follows the encryption flag.** Both KEDA Redis triggers
+  gain `enableTLS` and `passwordFromEnv: QUEUE_BULL_REDIS_PASSWORD` when
+  `redis_transit_encryption_enabled` is on, so queue-depth scaling keeps working
+  against the encrypted backend. TLS is the half that has to land: without it
+  KEDA opens a plaintext connection to a TLS-only endpoint and hangs on
+  `connection to redis failed: i/o timeout` before authentication is ever
+  attempted, so credentials alone would read as no fix at all. Nothing crashes
+  to announce it either, the HPA just reports `<unknown>` and workers freeze at
+  their current replica count. `passwordFromEnv` names an environment variable
+  rather than carrying the token, and KEDA resolves it against the worker pod's
+  first container (`n8n-worker`), which the chart already gives the token to via
+  `secretKeyRef`. So nothing sensitive is written into the ScaledObject and no
+  `TriggerAuthentication` resource is required. This relies on KEDA being
+  permitted to read Secrets outside its own namespace, which its chart allows by
+  default; installing KEDA with `KEDA_RESTRICT_SECRET_ACCESS=true` would stall
+  queue-depth scaling. Resolves
+  [#66](https://github.com/n8n-io/terraform-aws-n8n/issues/66).
+
+  Verified on a live cluster against KEDA 2.20.2, since none of this is visible
+  to a plan-time test. The ScaledObject reported `READY=True` with the HPA
+  reading a numeric `0/2 (avg), 0/2 (avg)` where the same deployment previously
+  reported `READY=False` and `<unknown>`, and the operator log carried no
+  timeout or auth errors. Driving the queue to 20 scaled workers from 2 to the
+  maximum of 6 in about 55 seconds, and clearing it returned them to 2. The AUTH
+  token appeared nowhere in the rendered ScaledObject.
+
+- `redis_high_availability_enabled` input (default `false`) provisions Redis as
+  a two-node `aws_elasticache_replication_group` (one primary, one replica,
+  `automatic_failover_enabled` and `multi_az_enabled`) instead of the
+  single-node `aws_elasticache_cluster` the module has always created. Redis
+  backs the Bull queue that distributes executions across workers and the
+  multi-main leader election, so the default single node is a single point of
+  failure for both: a node or AZ event stalls executions and leader election
+  until ElastiCache replaces it. Both nodes use `redis_node_type`, so the Redis
+  cost roughly doubles.
+
+  What this buys is durability of the queue, not an invisible failover, and the
+  distinction was measured rather than assumed. A forced failover on a live
+  cluster promoted the replica in about 20 seconds and left the queued
+  executions intact on the promoted node, but **every main, worker and webhook
+  pod exited and restarted** while it happened: n8n's `RedisClientService`
+  calls `process.exit` once Redis has been unreachable for
+  `QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD`. Raising that threshold to 30s was tried
+  and still fell short of this failover, so this release leaves n8n's default
+  alone; a larger reconnect budget can ride the failover out, and wiring the
+  threshold up is the follow-up in
+  [#77](https://github.com/n8n-io/terraform-aws-n8n/pull/77). Recovery is
+  automatic and completed inside a minute. Compare with the
+  single-node default, where losing the node means waiting for AWS to build a
+  replacement and the queue is gone with it.
+
+  Upgrade note: **flipping this on an existing deployment replaces Redis.** The
+  two topologies are different resource types, so no `moved` block can bridge
+  them; Terraform destroys the cluster and creates the replication group, and
+  everything queued or in flight goes with it. The replication group also
+  carries a deliberately distinct identifier (`<cluster_name>-redis-rg`),
+  because ElastiCache shares one identifier namespace between cache clusters
+  and replication groups and rejects a second resource reusing the name. With
+  a shared name the flip would destroy the old cache and then fail to create
+  the replacement, leaving no queue backend at all. See README → "Redis high
+  availability" for the drain-first procedure. Resolves part of
+  [issue #44](https://github.com/n8n-io/terraform-aws-n8n/issues/44).
+
+- `create_elasticache` (default `true`), `redis_host`, and `redis_port` inputs
+  mirror the existing `create_database` / `db_host` hook for the Redis tier.
+  With `create_elasticache = false` the module creates no ElastiCache cluster,
+  replication group, subnet group, or security group, and wires n8n and the
+  KEDA queue-depth triggers at the supplied endpoint instead. This is the hook
+  the cross-region HA/DR design presumes, so both regions can point at one
+  shared, replication-capable Redis.
+
+  As first written this hook wired host and port only, leaving an external Redis
+  that required AUTH or TLS unsupported. That gap is closed later in this same
+  release: `redis_transit_encryption_enabled` and `redis_auth_token` both apply on
+  this path now (see their entry above), so a TLS-only or authenticated external
+  Redis works. Two `check` blocks warn when the inputs and the toggle disagree,
+  rather than silently discarding what was asked for.
+
+  Still unsupported on this path: Redis 6+ ACL usernames. `redis_auth_token` is a
+  password only, which is all ElastiCache AUTH tokens ever are, but a self-hosted
+  Redis authenticating against a named ACL user needs a username too. The chart
+  exposes `redis.username` for exactly this, so surfacing it would be a small
+  additive input if someone needs it.
+
+  Upgrade note: gating the Redis tier on `create_elasticache` adds `count` to
+  `aws_elasticache_cluster.n8n`, `aws_elasticache_subnet_group.n8n`, and
+  `aws_security_group.redis`, changing their addresses from `.n8n` to
+  `.n8n[0]`. `moved` blocks in `refactoring.tf` absorb this, so upgrading on
+  the default path is an in-place no-op, verified against a live 0.2.x
+  deployment, not by inspection.
+
+- `redis_port` output, paired with the existing `redis_endpoint`, so a caller
+  wiring its own queue-depth scaler or a debug pod does not have to assume the
+  port. `redis_endpoint` now reports the replication group's primary endpoint
+  on the HA path and `var.redis_host` on the external path.
+
+- `n8n_license_detach_floating_on_shutdown` input (default `false`) maps to
+  `N8N_LICENSE_DETACH_FLOATING_ON_SHUTDOWN`, overriding n8n's own upstream
+  default of `true`. In multi-main (the module default), the leader main
+  detaching its floating license entitlement on shutdown zeroes the shared
+  cert in the database, so a fresh main pod starting as a follower fails the
+  init-time license gate and crash-loops, pushing an `atomic = true` Helm
+  release into a stuck `pending-rollback` state. All mains share the same
+  device fingerprint, so keeping this `false` safely reuses a single floating
+  seat across restarts. See
+  [issue #49](https://github.com/n8n-io/terraform-aws-n8n/issues/49) and
+  `docs/troubleshooting.md`.
+
+  Upgrade note: this changes runtime behavior for existing deployments.
+  Single-main deployments that rely on n8n's upstream detach-on-shutdown
+  behavior must now set `n8n_license_detach_floating_on_shutdown = true`
+  explicitly. The env var name is also reserved: an existing `n8n_extra_env`
+  entry named `N8N_LICENSE_DETACH_FLOATING_ON_SHUTDOWN` is now rejected at
+  plan time and must be moved to the new input.
+- Vendored two agent skills from
+  [hashicorp/agent-skills](https://github.com/hashicorp/agent-skills) into
+  `.agents/skills/` via the skills CLI, pinned by `skills-lock.json`:
+  `terraform-style-guide` and `terraform-test`. Coding agents working in this
+  repo pick them up automatically; module consumers are unaffected.
+- All five examples (`small`, `medium`, `large`, `cloudflare`, `godaddy`) now
+  expose the module's `n8n_image_tag` input as a passthrough variable
+  (default `null`, same tag-format validation as the module), so callers can
+  pin the n8n image version without editing the example source.
+- All six examples also expose `n8n_image_repository`,
+  `n8n_task_runner_image_tag`, `n8n_custom_extensions_path`, and
+  `n8n_image_pull_secrets` as passthrough variables (defaults matching the
+  module, same validation), so a custom image with baked-in nodes can be
+  deployed from an example without editing its source. The image inputs travel
+  together: a custom repository normally comes with a custom tag, a custom tag
+  normally needs the runner tag pinned, and baked-in nodes need the extensions
+  path set.
+- `db_allowed_security_group_ids` input allows sources to reach RDS by security
+  group rather than by address. Preferred over `db_allowed_cidr_blocks` inside
+  the VPC, since membership follows the instances and the rule survives subnet
+  changes and IP reuse. Emits no rule at all when empty, so it is a no-op diff
+  for existing deployments. Note that `aws_security_group.rds` is created
+  regardless of `create_database`, so with an external database the rules are
+  still written but front nothing; the variable descriptions now say so.
+- Three plan-time `check` blocks for configurations that are accepted but
+  probably not intended: `ingress_scheme` or `ingress_annotations` set while
+  `create_ingress = false` (silently inert), `ingress_annotations` replacing
+  `target-group-attributes` without `stickiness.enabled=true` (drops the
+  stickiness that keeps editor WebSockets alive, surfacing as a flaky network
+  rather than a config error), and `db_backup_retention_period = 0` (also
+  disables point-in-time recovery, which the variable name does not suggest).
+  All warn rather than fail, since each is legitimate in some deployment.
+- Two further `check` blocks guarding the external-database inputs in the
+  direction the module did not cover. `db_host` or `db_password` set while
+  `create_database = true` is the consequential one: the module builds its own
+  RDS instance and points n8n at that, so the apply succeeds and the workflows
+  land in a database the caller is not watching. The second warns when RDS
+  sizing or hardening inputs are tuned while `create_database = false`, where
+  no RDS instance exists for them to reach. Both cover the direction the module
+  did not: an input that is silently ignored rather than rejected.
+- `refactoring.tf` collects every `moved` block in one place instead of leaving
+  each beside the resource it renames. The blocks are unchanged and
+  position-independent, so this is purely organisational: the upgrade surface
+  is now reviewable in a single file.
+- `create_ingress` input (default `true`, so existing deployments are
+  unaffected) gates the module-managed ALB Ingress. Set it to `false` to bring
+  your own Ingress resources, for example the two-ALB split where an
+  internet-facing ALB serves `/webhook` and a separate internal, VPN-only ALB
+  serves the admin UI. When `false` the module also skips the Route 53 alias
+  A-record and the `data.aws_lb` lookup behind it, so a caller-owned DNS record
+  is no longer reverted on every plan; the ACM certificate is still issued when
+  `route53_zone_id` is set.
+- `ingress_scheme` input (default `internet-facing`, validated against
+  `internet-facing` / `internal`) replaces the hardcoded ALB scheme on the
+  module-managed Ingress.
+- `examples/split-ingress/`: a runnable reference for the two-ALB split at
+  `small` sizing: `create_ingress = false`, an internet-facing ALB serving only
+  the webhook path prefixes with an optional WAFv2 ACL, and an internal ALB
+  serving the editor UI and REST API. Issues one ACM certificate covering both
+  hostnames, writes both Route 53 alias records, and wires `n8n_webhook_url` so
+  n8n hands out webhook URLs on the public host. The split is asymmetric: the
+  public ALB carries the webhook prefixes and no catch-all, while the internal
+  one carries the prefixes plus the catch-all, so in-VPC callers can deliver
+  webhooks without egressing and never get the editor's SPA handler answering
+  200 to a webhook. Added to every CI matrix with 13 plan-time tests, including
+  assertions that the public ALB never gains a catch-all and that both ALBs
+  route every prefix to the webhook processors.
+
+  Validated against a live EKS deployment: both ALB target groups verified to
+  contain exactly the intended pods with no overlap, all five prefixes
+  confirmed reaching n8n on both ALBs, the admin host confirmed unreachable
+  from the internet, and the editor confirmed absent from the public ALB.
+- `ingress_annotations` input (`map(string)`, merged over the module defaults,
+  last write wins) for AWS Load Balancer Controller features the module has no
+  opinion on: WAF ACL, SSL policy, subnet pinning, security groups, inbound
+  CIDRs, ALB group sharing, access logs. This is the escape hatch that keeps a
+  one-annotation change from requiring a fork or a full bring-your-own Ingress.
+  A `check` block warns at plan time when it also sets
+  `alb.ingress.kubernetes.io/scheme`, since that silently overrides
+  `ingress_scheme` and the failure mode is a publicly exposed admin UI.
+- `n8n_service_name`, `n8n_webhook_service_name`, `n8n_webhook_path_prefixes`,
+  and `n8n_service_port` outputs expose everything a bring-your-own Ingress
+  needs to route correctly. Iterate `n8n_webhook_path_prefixes` rather than
+  hardcoding paths, so caller-owned Ingresses stay in step as n8n adds
+  endpoints.
+- `db_backup_retention_period` input (default `7`, validated 0–35) replaces the
+  hardcoded RDS `backup_retention_period`, so an out-of-band retention change
+  is no longer reverted on the next plan.
+- `db_allowed_cidr_blocks` input (default `[]`) appends CIDR blocks to the RDS
+  security group's inbound rule alongside the always-allowed VPC CIDR. A
+  standalone `aws_security_group_rule` attached at the root is not tracked by
+  the module's inline `ingress` block and gets stripped on every plan; this
+  input is the supported way to allow a corporate network, VPN pool, or peered
+  VPC.
+- `n8n_additional_domains` input (`list(string)`, default `[]`) for serving n8n
+  on more than one hostname. Each entry is added to the module-issued ACM
+  certificate as a subject alternative name, gets its own Route 53 validation
+  record and alias A-record, and gets its own Ingress rule so the ALB actually
+  routes it. Every host carries the full path set, webhook prefixes included, so
+  an additional hostname is not editor-only. `n8n_domain` stays canonical: it is
+  what n8n advertises as `WEBHOOK_URL` and `N8N_HOST`.
+
+  Validated for malformed hostnames, duplicates, repetition of `n8n_domain`, and
+  the ACM quota of 10 names per certificate. Names (including `n8n_domain`) are
+  normalized to lowercase before use: ACM stores certificate names in lowercase,
+  so a mixed-case input would never match its own entry in
+  `domain_validation_options` and the apply would fail pointing at the
+  validation record rather than the casing. Kubernetes also rejects uppercase
+  Ingress hosts, and DNS is case-insensitive, so the normalization is not
+  observable by callers. Two `check` blocks cover the cases
+  validation cannot: setting additional domains alongside a caller-supplied
+  `certificate_arn`, where the module cannot add names to a certificate it did
+  not issue and TLS fails with a name mismatch, and setting them alongside
+  `create_ingress = false`, where the names reach the certificate but the module
+  writes no Ingress rules or alias records for them. Both plan cleanly and fail
+  only at runtime, which is what made them worth a warning.
+
+  A `precondition` on `aws_acm_certificate_validation` catches the worst version
+  of this: a certificate name with no Route 53 validation record. That does not
+  fail a plan, it makes the apply hang until the validation times out, tens of
+  minutes later, reporting a resource that is not the cause. A precondition
+  rather than a `check` because `domain_validation_options` is computed, so the
+  comparison is unknown at plan; a precondition defers quietly and then fails
+  fast at apply, before the wait begins.
+
+  Surfaced in the `small` and `medium` examples, which use the Route 53 path.
+  Not applicable to `cloudflare` or `godaddy`, which issue their own
+  certificates through a non-AWS DNS provider.
+- `certificate_arn` output exposing the ACM certificate n8n is served with: the
+  module-issued and validated one when `route53_zone_id` is set, or the
+  caller-supplied ARN echoed back. This is what makes
+  `n8n_additional_domains` useful to a caller that owns its own Ingress
+  resources. It is sourced from `aws_acm_certificate_validation`, so consuming
+  it orders the caller's resources after validation completes.
+
+  `examples/split-ingress` now uses it. That example needs one certificate
+  covering two hostnames and previously hand-rolled the whole thing: the
+  certificate, a validation-record loop keyed off a statically known domain set,
+  and the validation resource, all duplicating what the module now does. It sets
+  `route53_zone_id` and `n8n_additional_domains` instead and attaches
+  `module.n8n.certificate_arn` to both Ingresses, cutting `dns.tf` from 103
+  lines to 67. The alias records stay in the example, because there are two
+  ALBs and each hostname points at a different one.
+
+  Consequently `n8n_additional_domains` with `create_ingress = false` is a
+  supported pattern rather than a suspicious one, and emits no warning: the
+  certificate still covers every name and every name still gets a validation
+  record, while routing and DNS remain the caller's, which is what
+  `create_ingress = false` means.
+
+  `subject_alternative_names` is passed as `null` rather than `[]` when the list
+  is empty, so deployments predating this input see no diff on what is a
+  ForceNew attribute. The additional alias records live in a separate resource
+  from `aws_route53_record.n8n_alias` deliberately: converting that resource
+  from `count` to `for_each` would move it from `[0]` to `["<domain>"]`, and a
+  `moved` block cannot express that because its addresses must be static, so
+  every existing deployment would destroy and recreate its alias record.
+- `db_kms_key_arn` input (default `null`) lets a caller supply the ARN of an
+  existing KMS key for RDS storage encryption, Performance Insights data, and
+  the postgresql CloudWatch log group, instead of the module minting its own
+  Customer Managed Key (`aws_kms_key.db`). For organizations with a security
+  team that centrally owns all KMS keys and does not permit Terraform modules
+  to create new ones, this was previously a hard blocker: the module's CMK was
+  unconditional whenever `db_storage_encrypted = true` (the default), with no
+  escape hatch.
+
+  `aws_kms_key.db` and `aws_kms_alias.db` now gate on
+  `var.create_database && var.db_storage_encrypted && var.db_kms_key_arn == null`,
+  one more static, plan-time-known condition added to the ternary that was
+  already there, not a change from an unconditional resource to a conditional
+  one. `local.db_kms_key_arn` prefers `var.db_kms_key_arn` over
+  `aws_kms_key.db[0].arn` when both could apply, and feeds `kms_key_id` on
+  `aws_db_instance.n8n`, `performance_insights_kms_key_id`, and
+  `aws_cloudwatch_log_group.rds_postgresql.kms_key_id` exactly as before. It is
+  also gated on `var.db_storage_encrypted`, which keeps that flag the single
+  switch deciding whether this module encrypts anything with a CMK: without the
+  gate a supplied key still reached the log group while
+  `db_storage_encrypted = false`, contradicting both that resource's
+  null-passthrough contract and the `check` block below. A `validation` block
+  requires the value to look like a KMS key ARN
+  (`arn:aws:kms:<region>:<account-id>:key/<key-id>`), rejecting an alias ARN or
+  a malformed string at plan time. A new `check` block,
+  `db_kms_key_arn_requires_module_managed_encrypted_database`, warns (does not
+  fail) when `db_kms_key_arn` is set alongside `create_database = false` or
+  `db_storage_encrypted = false`, where it would be silently ignored.
+
+  **The supplied key's policy must grant the regional CloudWatch Logs service
+  principal `kms:Encrypt`, `kms:Decrypt`, `kms:ReEncrypt*`,
+  `kms:GenerateDataKey*` and `kms:DescribeKey`, or the apply fails.** RDS reaches
+  the key through a grant, so storage and Performance Insights need nothing
+  beyond the default root statement, but CloudWatch Logs rejects
+  `CreateLogGroup` against a key it cannot use, with
+  `InvalidParameterException`, and it fails there, before the RDS instance is
+  created, leaving a half-built stack. This cannot be caught at plan time: no
+  AWS provider data source returns a key policy, so there is no `check` block to
+  write. README.md → "Bring your own KMS key for RDS" carries the exact
+  statement to add, which is the `AllowCloudWatchLogsEncrypt` statement the
+  module puts on its own CMK.
+
+  Left at its default `null`, behavior is unchanged: the module still creates
+  its own CMK exactly as before. No `moved` block was needed: verified by
+  planning both the pre-change and post-change code against identical default
+  variables (mock providers, `terraform test`) and confirming both plans
+  propose creating `aws_kms_key.db[0]` and `aws_kms_alias.db[0]` at the same
+  addresses with the same action; the added condition only changes the
+  expression's value when `db_kms_key_arn` is actually set, which no existing
+  deployment can do since the input did not previously exist. This was
+  validated at plan time only, against mocked providers; no real AWS apply was
+  performed.
+
+- **Default S3 server-side encryption.** `aws_s3_bucket_server_side_encryption_configuration.n8n`
+  is a genuinely new resource: the module-managed bucket previously had no
+  server-side encryption configuration at all (`grep -rn
+  server_side_encryption` across the repo turned up nothing before this
+  change). Defaults to SSE-KMS (`aws:kms`) with a module-created Customer
+  Managed Key, driven by the new `s3_kms_encryption_enabled` input, which
+  defaults to `true`. Set that input to `false` to fall back to SSE-S3
+  (`AES256`, AWS-managed key) instead. `s3_kms_key_arn` is a separate input
+  and does not choose the algorithm: it swaps a key you already own in for
+  the module-created CMK on a bucket that is SSE-KMS either way. Supplying it
+  skips `aws_kms_key.s3`, not this encryption configuration, which is still
+  written and simply names your key.
+
+  `s3_kms_key_arn` also adds a second statement to `aws_iam_policy.s3` granting
+  the n8n Pod Identity role `kms:Decrypt`, `kms:GenerateDataKey` and
+  `kms:DescribeKey`, scoped to that one key. SSE-KMS requires this of the
+  *requesting* principal: S3 performs the crypto as the caller, so a `GetObject`
+  needs `kms:Decrypt` and a `PutObject` needs `kms:GenerateDataKey`, and without
+  it every n8n binary-data read and write returns `AccessDenied` while the
+  bucket, its encryption configuration and the S3 half of the IAM policy all read
+  as correct. Because of that grant the input is meaningful on **both** bucket
+  paths, including `create_s3_bucket = false`: the module does not encrypt a
+  bucket it did not create, but it does have to be told which key that bucket is
+  already encrypted with, and it cannot read the bucket's configuration to infer
+  it. Anyone supplying an SSE-KMS bucket via `existing_s3_bucket_name` must set
+  `s3_kms_key_arn` too. The `validation` block accepts key ARNs only, not alias
+  ARNs, since an IAM policy `Resource` element cannot reference a KMS alias and a
+  grant written against one would silently match nothing. Not verified against a real upgrade of a live
+  deployment (no live cluster was available for this change); the plan-time
+  test suite confirms the resource plans cleanly and that no other S3 resource
+  changes shape as a result of adding it. Since the resource is new rather than
+  a change to an existing one's arguments, it should attach without touching
+  the existing bucket, but treat that as reasoning rather than a measured
+  upgrade result until verified on a real cluster.
+
+- **Bring your own S3 bucket.** `create_s3_bucket` input (default `true`,
+  mirroring `create_database`) and `existing_s3_bucket_name` input (required
+  when `create_s3_bucket = false`) let a caller point n8n at an S3 bucket they
+  already manage instead of the module creating one. With
+  `create_s3_bucket = false` the module creates no `aws_s3_bucket`, no
+  `aws_s3_bucket_public_access_block`, and no server-side encryption
+  configuration (the supplied bucket is the caller's to secure) but still
+  attaches `aws_iam_policy.s3` and the `aws_iam_role.s3` Pod Identity
+  association to the bucket's ARN, so the `n8n-enterprise` service account can
+  read and write it exactly as it would a module-managed bucket. The
+  `s3_bucket_name` output and `local.s3_bucket_name` (consumed by the Helm
+  release's `s3.bucket.name` value in `n8n.tf`) both resolve to whichever
+  bucket is actually in play.
+
+  The input is named `existing_s3_bucket_name` rather than `s3_bucket_name` to
+  avoid reading as the same name as the pre-existing `s3_bucket_name` output:
+  Terraform's input and output namespaces don't collide, but the two would be
+  easy to confuse in a caller's `tfvars`, the same reasoning that keeps
+  `db_host` distinct from the `rds_endpoint` output.
+
+  `aws_s3_bucket.n8n` and `aws_s3_bucket_public_access_block.n8n` moved from
+  unconditional to `count`-gated, changing their state address from `.n8n` to
+  `.n8n[0]` for every deployment left at the default `create_s3_bucket = true`.
+  `moved` blocks in `refactoring.tf` cover both, following the same pattern as
+  `create_database`'s existing blocks for `aws_db_subnet_group.n8n` and
+  `aws_db_instance.n8n`.
+
+  A plan-time `check` block,
+  `existing_s3_bucket_name_requires_create_s3_bucket_false`, warns (without
+  failing) when `existing_s3_bucket_name` is set while `create_s3_bucket = true`,
+  where the module creates its own bucket and the supplied name is ignored. There
+  is deliberately no equivalent check for `s3_kms_key_arn` alongside
+  `create_s3_bucket = false`: that combination is now the supported way to use a
+  caller-supplied SSE-KMS bucket, so warning on it would steer people away from
+  the one setting that makes their deployment work. The inverse (an SSE-KMS
+  bucket supplied with no `s3_kms_key_arn`) is the remaining footgun and is not
+  checkable, since the module would have to read the bucket's encryption
+  configuration through a data source, adding an AWS call at plan time and a hard
+  failure for anyone whose credentials cannot read it.
+
+- `iam_permissions_boundary_arn` input (default `null`) sets
+  `permissions_boundary` on every IAM role this module creates:
+  `aws_iam_role.cluster` and `aws_iam_role.nodes` (`eks.tf`),
+  `aws_iam_role.s3` (`s3.tf`), `aws_iam_role.lbc`,
+  `aws_iam_role.cluster_autoscaler`, `aws_iam_role.ebs_csi` (`iam.tf`), and
+  `aws_iam_role.rds_enhanced_monitoring` (`database.tf`, which exists only when
+  `create_database = true`). Seven roles in total; in an account whose SCP
+  enforces a boundary, missing any single one is enough to fail the whole apply.
+  Many organizations enforce an SCP or IAM policy requiring every role created
+  in-account to carry a permissions boundary, and without this input those
+  accounts could not use the module at all. Validated against the shape of an
+  IAM policy ARN (`arn:aws:iam::<account-id>:policy/...`) so a typo fails at
+  plan time rather than surfacing as an opaque `AccessDenied` on `CreateRole`.
+
+  `permissions_boundary = null` is a documented no-op in the AWS provider (the
+  argument is simply omitted from the API call), so every role takes the
+  argument unconditionally with no `count` or conditional gating, and the
+  default leaves every role exactly as boundary-less as before this input
+  existed: no diff for existing deployments.
+
+  Verified at plan time only: `terraform test` asserts
+  `permissions_boundary` is `null` on all seven roles by default and equal to a
+  supplied ARN on all seven when set, and that an ARN failing the regex is
+  rejected by the variable's `validation` block. Those runs enumerate the roles by
+  hand, which is a known weakness: Terraform's test language cannot enumerate
+  resources, so a role added later and left unwired would keep the suite green.
+  `grep -c 'resource "aws_iam_role"' *.tf` is the manual check, and it must equal
+  seven. This has **not** been
+  applied against a real AWS account with an enforced permissions-boundary
+  SCP; that is the one behavior a mocked plan cannot exercise (the mock `aws`
+  provider does not model boundary enforcement or denial), so treat this as
+  confirmed wiring rather than a confirmed unblock. Anyone adopting this in an
+  SCP-enforced account should run a real `terraform plan`/`apply` against that
+  account before relying on it.
+
+- `db_logs_kms_key_arn` input (default `null`) encrypts the `postgresql`
+  CloudWatch log group when `db_kms_key_arn` is supplied. It exists because
+  the module cannot verify that a caller-supplied key's policy lets
+  CloudWatch Logs use it; setting this input is the caller asserting that it
+  does, and it can name a different key their organization has already
+  blessed for logs. Ignored, with a `check` block saying so, whenever
+  `db_kms_key_arn` is `null`, because on that path the module created the CMK
+  and wrote the CloudWatch Logs statement onto it itself. See the
+  corresponding entry under Fixed.
+
+- `redis_username` input (default `null`) authenticates against a named
+  Redis 6+ ACL user on an external Redis, passed through to the chart's
+  `redis.username`. `redis_auth_token` supplies a password only, which is all
+  an ElastiCache AUTH token ever is, so a self-hosted Redis that
+  authenticates against a named user could not be reached through the
+  bring-your-own hook even with the token input available. Relevant only when
+  `create_elasticache = false`; a `check` block warns when it is set on the
+  module-managed path, where ElastiCache AUTH has no username concept.
+
+  Queue-depth autoscaling survives it. KEDA's Redis scaler declares its
+  `Username` field with
+  `keda:"name=username, order=triggerMetadata;resolvedEnv;authParams"`, so
+  the module wires the username into the `ScaledObject` trigger metadata
+  alongside the existing TLS and password-from-env settings. n8n reads
+  `QUEUE_BULL_REDIS_USERNAME` in
+  `packages/@n8n/config/src/configs/scaling-mode.config.ts`, which notes that
+  Redis 6.0 or higher is required.
+
+- `db_snapshot_identifier` input (default `null`) stands the module-managed
+  database up from an existing RDS snapshot instead of creating an empty one.
+  It is the other half of `n8n_encryption_key`: that input exists so a
+  rebuilt stack can decrypt the credentials an existing database already
+  holds, yet the only way to reach that state was
+  `create_database = false`, which gives up the module's management of the
+  subnet group, security group, CMK, log group retention, Enhanced
+  Monitoring and Performance Insights. Ignored, with a `check` block, when
+  `create_database = false`.
+
+  Four behaviours govern whether a restore works, three verified against the
+  `RestoreDBInstanceFromDBSnapshot` API reference and one against the
+  provider source, and all but the last are now checked at plan time by
+  describing the snapshot with `data.aws_db_snapshot`:
+
+  - **`snapshot_identifier` is `ForceNew`.** Setting it on a deployment that
+    already has a database destroys that database and restores the snapshot
+    in its place. It is for standing up a fresh stack around existing data,
+    not for reloading a running one.
+  - **Encryption comes from the snapshot and cannot be set while restoring**,
+    and both `storage_encrypted` and `kms_key_id` are `ForceNew`. A
+    configuration that disagrees does not fail once: Terraform wants to
+    replace the instance on every apply and can never reconcile. So the
+    inputs have to describe the snapshot. An unencrypted snapshot needs
+    `db_storage_encrypted = false`; an encrypted one needs `db_kms_key_arn`
+    set to the snapshot's own key, since a module-created CMK can never match
+    a snapshot that predates it. The key is compared on its UUID rather than
+    by whole-string equality, because a snapshot's `kms_key_id` can come back
+    as either the full ARN or the bare ID and a false mismatch would be worse
+    than no check.
+  - **The engine must be `postgres`** and `db_allocated_storage` must be at
+    least the snapshot's size, which AWS requires or the restore fails.
+  - **RDS ignores `DBName` when restoring PostgreSQL** ("This parameter only
+    applies to RDS for Oracle and RDS for SQL Server DB instances"), so the
+    restored database keeps its own name while this module sets
+    `n8n_enterprise`, and `db_name` is `ForceNew` too. No data source exposes
+    a snapshot's database name, so this one is documented rather than
+    checked: restore from a snapshot taken of a module-managed instance.
+
+  The master password does apply, despite the restore API taking no password
+  parameter: the AWS provider issues a `ModifyDBInstance` with
+  `MasterUserPassword` immediately afterwards. Worth re-checking on a
+  provider major bump, because n8n silently cannot connect if that ever
+  changes.
+
+  A further `check` warns when `db_snapshot_identifier` is set and
+  `n8n_encryption_key` is not. That combination is the one restore mistake
+  neither Terraform nor AWS can see: the apply succeeds, the workflows come
+  back, and every credential in them is unreadable, because n8n encrypted
+  them under the key of the instance the snapshot was taken from. It stays a
+  warning rather than an error, since restoring for the workflow data while
+  treating the credentials as disposable is a legitimate thing to want.
+
+- **Four inputs for the n8n defaults that are scheduled to change.** n8n prints
+  a deprecation warning on every pod start for four settings whose defaults it
+  intends to move in a future version. The warnings fire because nothing sets
+  them, not because setting them is wrong: n8n is asking operators to pin
+  today's value before it changes.
+
+  `n8n_task_runner_timeout` (default `300`) maps to
+  `N8N_RUNNERS_TASK_TIMEOUT` and is **emitted unconditionally**, which is the
+  one place this group departs from the module's usual omit-when-null
+  convention. n8n has announced this default drops from 300 seconds to 60, and
+  that change is a pure functional regression: nothing about a Code node task
+  that runs for four minutes becomes unsafe when the ceiling drops, it simply
+  starts failing, in a deployment where nothing changed but the n8n version.
+  Since 300 is n8n's current default, pinning it changes nothing today. Set it
+  to `60` to adopt n8n's future default early. Not to be confused with the
+  existing `n8n_task_runner_request_timeout`, which governs how long n8n waits
+  for a runner to *accept* a task rather than how long the task may then run;
+  both descriptions now say so.
+
+  `n8n_unverified_packages_enabled`,
+  `n8n_compression_max_decompressed_size_bytes` and
+  `n8n_compression_max_zip_entries` (all default `null`, env var omitted) map
+  to the remaining three. These are deliberately **not** pinned. Each is n8n
+  tightening a security posture rather than changing behaviour arbitrarily:
+  unverified community packages, and two limits bounding what the Compression
+  node will expand a hostile archive into. Freezing the permissive value on
+  every deployment's behalf is not a decision this module should make, so it
+  leaves them to n8n and exposes the lever for callers whose workflows
+  genuinely need the larger limit.
+
+  All four names are reserved against `n8n_extra_env`
+  (`N8N_RUNNERS_TASK_TIMEOUT` via the existing `N8N_RUNNERS_` prefix, the other
+  three by name), so an override there is rejected at plan time rather than
+  silently unpinning the timeout or moving a limit with no input to show for
+  it.
+
+  Two other warnings on n8n's list are not the module's to fix, and are
+  documented as expected rather than chased: `WEBHOOK_URL` is superseded by
+  `N8N_WEBHOOK_URL`, but the chart writes `WEBHOOK_URL` itself from the ingress
+  host and has no support for the successor, so the warning survives anything
+  the module does; `N8N_AVAILABLE_BINARY_DATA_MODES` comes from the chart too.
+  Both need an upstream chart change. Two further deprecations in that file do
+  not fire here at all: the chart sets
+  `OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true`, and
+  `N8N_DEFAULT_BINARY_DATA_MODE` only warns on the literal value `default`,
+  which this module never sets.
+
+### Changed
+
+- **Default HPA maxima now fit the default node group.**
+  `n8n_main_hpa_max_replicas` drops from `20` to `6` and
+  `n8n_webhook_hpa_max_replicas` from `50` to `8`. The old defaults were
+  unschedulable by construction: 20 main pods plus their task runner sidecars
+  request 24,000m CPU on their own, more than the entire default node group
+  (`node_max = 6` × t3.xlarge = 24 vCPU) can ever provide, before the worker and
+  webhook ceilings are counted at all.
+
+  The failure mode is not a plan error but a slow one. During a rollout with
+  elevated CPU the HPAs scale toward their maxima, the Cluster Autoscaler hits
+  `node_max`, and the pods that do not fit sit `Pending` with `Insufficient cpu`
+  (15 of them in the deployment that surfaced this). The surging ReplicaSet then
+  competes for the same exhausted CPU, which stretches out the rollout until the
+  HPAs are capped by hand.
+
+  At the new defaults the three pod families request 16,600m against roughly
+  21,720m schedulable, leaving headroom for a rolling-update surge.
+
+  Upgrade note: an explicit ceiling is untouched. Both HPAs update in place, with
+  no resource replacement, but a cluster currently running more than 6 main or 8
+  webhook pods will be scaled back to the new ceiling on the next apply. If you
+  rely on the old ceilings, set them explicitly and size `node_max` /
+  `node_instance_type` to match.
+
+  One case fails the plan outright: an explicit floor above the new ceiling, which
+  a caller could reach without changing anything. `n8n_main_hpa_min_replicas = 8`
+  or `n8n_webhook_hpa_min_replicas = 10` was valid against the old ceilings of 20
+  and 50, and against the new ones is not:
+
+  ```
+  Error: Invalid value for variable
+    │ var.n8n_main_hpa_max_replicas is 6
+    │ var.n8n_main_hpa_min_replicas is 8
+  n8n_main_hpa_min_replicas must not exceed n8n_main_hpa_max_replicas
+  ```
+
+  Raise the matching ceiling explicitly, and `node_max` /
+  `node_instance_type` with it. The new validation below is what makes this a
+  plan-time error naming both inputs, rather than a Kubernetes rejection partway
+  through `helm upgrade`.
+
+  `examples/medium` and `examples/large` now pin the main pod range explicitly
+  (3/24 and 6/60) rather than inheriting it, so it is tied to each tier's node
+  group instead of to the starter default, and both tiers' sizing tables gained a
+  main-pod row. The raised floors match the warm-floor approach both tiers already
+  take for webhook and worker pods: n8n pods take tens of seconds to boot, so a
+  floor of 2 puts an editor or API burst behind pod startup. Main pods carry
+  neither production webhooks (the module sets
+  `disableProductionWebhooksOnMainProcess`) nor manual executions (the chart sets
+  `OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS`), so a main ceiling tracks concurrent
+  editor and REST API users, not a tier's executions/day. Resolves
+  [#51](https://github.com/n8n-io/terraform-aws-n8n/issues/51).
+
+- `node_instance_type`, `node_max`, `n8n_task_runners_enabled`, and the six
+  autoscaler floor and ceiling inputs now declare `nullable = false`. A caller
+  passing an explicit `null` for one of these previously propagated it into
+  the module instead of falling back to the default, and once the capacity
+  check existed that null aborted the plan from inside the check's
+  interpolations (see the AGENTS.md note on null and `nullable = false`).
+  With `nullable = false`, Terraform substitutes the declared default at the
+  variable boundary. Only callers writing a literal `null` for one of these
+  nine inputs observe any change: they now get the default silently rather
+  than an error partway through the plan.
+
+- `aws_route53_record.cert_validation` keys its `for_each` off
+  `local.acm_domain_names` instead of the certificate's computed
+  `domain_validation_options`, and selects each record's values by matching
+  `domain_name` rather than assuming a single validation option. For a
+  deployment with no additional domains the key is unchanged and there is no
+  state churn: verified on a live 0.2.0 deployment, where the existing record
+  refreshed in place with no move and no replacement.
+
+  The original motivation was testability rather than correctness, since the
+  real AWS provider populates `domain_validation_options` with known keys at
+  plan time while the mock provider leaves the whole attribute unknown, which
+  made every test that sets `route53_zone_id` unplannable. That was why the
+  Route 53 path had no coverage at all; both directions of the `create_ingress`
+  alias gate are now asserted. Sourcing the keys from `local.acm_domain_names`
+  is also what makes `n8n_additional_domains` work, since the record set and the
+  certificate's name list now come from the same place and cannot drift.
+
+- **The licence key no longer reaches n8n through Helm values.**
+  `license.activationKey` was set inline to `var.n8n_license_key`, so it was
+  rendered into the Helm release values and stored in the release Secret
+  in-cluster, on top of Terraform state. Every other credential the module
+  handles (database password, Redis token, encryption key) already went
+  through a `kubernetes_secret` and an `existingSecret` chart value; the
+  license key was the exception. It is now a key in the existing
+  `kubernetes_secret.n8n`, referenced by name. The task runner auth token
+  stays a literal `taskRunners.authToken.value`, unchanged: it encrypts
+  nothing, so moving it into a Secret would add a resource for no security
+  benefit.
+
+  The chart template is `if .Values.license.activationKey / else if
+  .Values.license.existingSecret.name`, so `activationKey` had to be dropped
+  rather than merely supplemented: sending both silently keeps the inline
+  path.
+
+  Verified by rendering chart 1.10.0, the version this module pins, with the
+  exact value shape the module sends: `n8n-main`, `n8n-worker` and
+  `n8n-webhook-processor` all resolve `N8N_LICENSE_ACTIVATION_KEY` through
+  `secretKeyRef`, and no literal renders anywhere in the manifests.
+
+  This does not remove the licence key from Terraform state: it is a module
+  input either way, so it is in state regardless; what changes is that it
+  stops being copied into the Helm release as well. Callers see a pod
+  restart on the next apply.
+
+### Security
+
+- checkov now runs with `soft_fail: false` in CI (`.github/workflows/terraform-tests.yml`):
+  every finding is curated instead of silently absorbed. Resolves
+  [#27](https://github.com/n8n-io/terraform-aws-n8n/issues/27). Highlights:
+
+  - EKS control-plane logging is now enabled for all five log types
+    (`aws_eks_cluster.n8n.enabled_cluster_log_types`), writing to an
+    explicit, retained CloudWatch log group instead of nothing.
+  - EKS Kubernetes Secrets are now envelope-encrypted with a module-created
+    KMS CMK by default (new `var.eks_secrets_encryption_enabled`, defaults
+    `true`). This is a real infrastructure change with an ongoing KMS cost;
+    set the variable to `false` to preserve unencrypted behavior on an
+    existing cluster before the first apply. The supported AWS provider adds
+    encryption to a live unencrypted cluster in place; disabling it afterwards
+    forces replacement because EKS cannot disassociate an encryption config.
+  - EKS API endpoint access is now configurable (new
+    `var.cluster_endpoint_public_access`,
+    `var.cluster_endpoint_public_access_cidrs`,
+    `var.cluster_endpoint_private_access`). Defaults preserve the existing
+    public-endpoint, unrestricted-CIDR posture.
+  - The Cluster Autoscaler IAM policy's write actions
+    (`SetDesiredCapacity`, `TerminateInstanceInAutoScalingGroup`) are now
+    scoped with a `ResourceTag` condition to this cluster's own node group
+    ASGs, instead of an unconditional `Resource = "*"`.
+  - ElastiCache Redis now takes a daily automatic snapshot by default (new
+    `var.redis_snapshot_retention_limit`, defaults `1`). Set on both Redis
+    topologies, so opting into `redis_high_availability_enabled` or
+    `redis_transit_encryption_enabled` or `redis_kms_encryption_enabled` does
+    not silently drop the snapshot the default single-node cluster takes.
+  - The S3 bucket's default encryption is now SSE-KMS with a module-created
+    CMK, with S3 Bucket Keys enabled so KMS is called per bucket rather than
+    per object (new `var.s3_kms_encryption_enabled`, defaults `true`). The n8n
+    pod role gains `kms:Decrypt` / `kms:GenerateDataKey` on that key, which
+    SSE-KMS requires for every read and write. This selects which key
+    encrypts objects, not whether they are encrypted: S3 encrypts everything
+    regardless, and `false` leaves the bucket on SSE-S3. It applies to objects
+    written afterwards, so existing objects keep the encryption they were
+    written with. The bucket encryption resource waits for the pod role's KMS
+    policy update before activating, avoiding an upgrade-time read/write race.
+    Changing the toggle from `true` to `false` while old objects still use the
+    CMK makes them immediately unreadable when KMS schedules key deletion.
+  - The module can optionally attach a module-managed parameter group
+    (`aws_db_parameter_group.n8n`) that logs DDL statements and queries slower
+    than 1s, and sets `rds.force_ssl = 1` (`db_query_logging_enabled`, default
+    `false`). Deliberately not
+    `log_statement = all`, which would copy workflow and execution payloads
+    into CloudWatch Logs. `rds.force_ssl = 1` is already the RDS default on
+    PostgreSQL 15 and later, and n8n connects over TLS by default, so it
+    changes nothing at the module's default `db_engine_version`. It defaults
+    off because `engine_version` is ignored on existing state: a live
+    PostgreSQL 16 instance may coexist with the configured 18.4 value, and RDS
+    rejects a postgres18 parameter group on that instance. Enable it for a new
+    deployment or after confirming the live major matches. Note that
+    moving an existing instance from the default parameter group to a custom
+    one takes effect only after a reboot, so these settings land in the next
+    maintenance window rather than at apply time.
+  - `examples/large` gains equivalent opt-in query logging for Aurora
+    (`aurora_query_logging_enabled`, default `false`), split
+    across two parameter groups because Aurora PostgreSQL requires it:
+    `rds.force_ssl` exists only in the DB *cluster* parameter family, and
+    `log_statement` / `log_min_duration_statement` only in the DB *instance*
+    family (verified with
+    `aws rds describe-engine-default-cluster-parameters --db-parameter-group-family aurora-postgresql18`,
+    which lists neither of the latter two among its 142 parameters; the same
+    holds for `aurora-postgresql16`). The opt-in default prevents an existing
+    Aurora 16 cluster retained by `ignore_changes` from receiving incompatible
+    Aurora 18 groups. When enabled, the example carries an
+    `aws_rds_cluster_parameter_group` for the TLS setting and an
+    `aws_db_parameter_group` attached to the writer and reader for the logging
+    settings. Checkov's `CKV2_AWS_27` asks for the log parameters on the
+    cluster group specifically, which is a configuration AWS rejects at apply
+    with "Could not find parameter with name: log_statement", so that finding
+    carries an annotated skip rather than a fix.
+  - Security group egress rules (RDS, Redis, `examples/large` Aurora) now
+    carry an explicit description.
+  - `examples/large`'s `kubernetes_deployment.pgbouncer` now sets container
+    resource requests/limits and a security context (dropped Linux
+    capabilities, no privilege escalation).
+
+  Findings that are intentional for this module's getting-started posture
+  (permissive security group egress, the public EKS endpoint by default,
+  the upstream-verbatim AWS Load Balancer Controller IAM policy, Terraform
+  Registry module sources carrying a `version` constraint rather than a
+  commit hash, S3 bucket versioning and lifecycle rules that would defeat
+  n8n's own data pruning, cross-region replication and access logging that
+  need buckets this module does not create, AWS Backup for the `examples/large`
+  Aurora cluster and Multi-AZ automatic failover on the replication group's
+  TLS-only shape)
+  each carry an inline `checkov:skip=<ID>:<reason>` annotation at the resource
+  that causes them. Two more are annotated because checkov reports them against
+  a resource that is in fact configured correctly: it builds no graph edge
+  between two `count`-expanded resources, so it cannot see the RDS instance's
+  parameter group (`CKV2_AWS_30`) or the Redis security group's attachment to
+  whichever cache topology is active (`CKV2_AWS_5`). Both skips record the
+  experiment that isolated the artifact, which in each case is that deleting
+  `count` from the one resource makes the finding disappear with nothing else
+  changed. No check is suppressed repo-wide: the new `.checkov.yaml` sets only
+  a `skip-path` for the `tests/` directories, so every check stays live on code
+  added later. See the annotations themselves for the reasoning behind each
+  one.
+
+- The checkov version is now pinned (`CHECKOV_VERSION` in
+  `.github/workflows/terraform-tests.yml`) and CI runs
+  `tests/scripts/check-checkov.sh`, the same script contributors run, instead
+  of `bridgecrewio/checkov-action`. The action bakes the checkov version into
+  its own image, so its `@v12` tag moved to a newer checkov on its own
+  schedule. That is not theoretical: 3.3.9 evaluates whole check families
+  (every `aws_s3_bucket` check, several `CKV2_*` graph checks) against
+  resources reached through a local module source that 3.3.0 skipped silently,
+  which is how a clean local run became ten CI failures. The script now
+  refuses to run against a version other than the pinned one, so a local pass
+  and a CI pass mean the same thing. Bumping the pin is a deliberate change
+  that curates whatever the new release reports. `task checkov` runs the same
+  script, and the `task ci` description no longer claims checkov is
+  soft-failed.
+
+  The `terraform-docs` pin in the same workflow had drifted the same way: it
+  sat at `v0.22.0` while the `brew` default its comment tracks had moved to
+  `v0.24.0`. It is now realigned. That drift happened to be harmless, because
+  the two versions render this repo's tables identically, but it was the same
+  trap one release away from producing spurious README diffs.
+
+- New `var.cluster_endpoint_public_access_cidrs` rejects a malformed CIDR and
+  an empty list at plan time, and `var.cluster_endpoint_private_access`
+  rejects the both-endpoints-disabled combination that EKS would refuse
+  minutes into an apply.
+
+- `variables.tf` gains two banner sections, `EKS cluster` (API server endpoint
+  access and Secrets encryption) and `S3` (bucket encryption), both recorded in
+  AGENTS.md's banner table. The four EKS inputs sit in their own section rather
+  than under `Foundation inputs`, which covers infrastructure the caller
+  supplies rather than control-plane properties the module owns.
+
+### Added
+
+- `n8n_license_key_secret_ref`, `db_password_secret_ref`,
+  `redis_auth_token_secret_ref` and `n8n_encryption_key_secret_ref` inputs.
+  Each is its value-input counterpart plus `_secret_ref`, and takes
+  `{name, key}` (key optional, defaulting per credential) naming a Kubernetes
+  Secret the caller already manages, e.g. one synced by External Secrets
+  Operator, instead of a raw value the module has to put in Terraform state on
+  the way through. The module never reads the referenced Secret's contents: it
+  only wires the chart's `existingSecret` / `passwordSecret` value at the name
+  and key given, so the credential never reaches Terraform state through this
+  path. Null by default on all four, so leaving them unset is a no-op for
+  every existing deployment. The task runner auth token has no equivalent
+  input: it encrypts nothing and matches no external system, so there is
+  nothing a caller-supplied value or Secret reference would add; the module
+  always generates it, unchanged from before this release.
+
+  The mechanism differs by credential, and getting it backwards was the
+  likeliest way to break this on a first pass. `db_password_secret_ref` and
+  `redis_auth_token_secret_ref` gate `kubernetes_secret.n8n_db` /
+  `kubernetes_secret.n8n_redis` to zero; both are rejected at plan time with
+  `create_database = true` / `create_elasticache = true`, since
+  `aws_db_instance.n8n` (`database.tf:374`) and
+  `aws_elasticache_replication_group.n8n` (`redis.tf:190`) need the
+  credential's actual value to provision that infrastructure, which a Secret
+  name cannot supply. `kubernetes_secret.n8n` is shared with configuration the
+  module still computes (`N8N_HOST`, `N8N_PORT`, `N8N_PROTOCOL`, `WEBHOOK_URL`),
+  so `n8n_license_key_secret_ref` drops its one key from that Secret's `data`
+  instead of gating the resource; the Secret itself keeps existing on that
+  path.
+
+  `n8n_encryption_key_secret_ref` is the exception to that: the chart's
+  `secretRefs.existingSecret` names a single Secret that `n8n.coreSecretsEnv`
+  reads all four of `N8N_ENCRYPTION_KEY`, `N8N_HOST`, `N8N_PORT` and
+  `N8N_PROTOCOL` from, so setting it replaces `kubernetes_secret.n8n` entirely.
+  That leaves the license key with nowhere to live unless it is also supplied
+  through `n8n_license_key_secret_ref`, so the module requires it whenever
+  `n8n_encryption_key_secret_ref` is set, and rejects the plan otherwise. The
+  task runner auth token is unaffected, since it never lived in
+  `kubernetes_secret.n8n` to begin with. See README.md → "Consuming a Secret
+  you already manage instead" for the full mechanism and a worked
+  `ExternalSecret` example covering the four-key contract.
+
+  Setting a `*_secret_ref` input alongside its value counterpart is rejected at
+  plan time, naming both inputs, rather than one silently winning the way the
+  chart's `license.activationKey` precedence rule already did once before (see
+  Finding 1 above). `db_password_secret_ref` and `redis_auth_token_secret_ref`
+  gained `moved` blocks in `refactoring.tf` for `kubernetes_secret.n8n_db` and
+  `kubernetes_secret.n8n`, both of which carried no `count` before this change
+  and therefore change address for every deployment that leaves both inputs
+  null; `kubernetes_secret.n8n_redis` needed no equivalent block, since it was
+  already `count`-gated on `local.redis_auth_active` and only gained a second,
+  narrower condition.
+
+  The module does not verify that a referenced Secret exists or carries the
+  expected key: reading it to check would put the credential back in Terraform
+  state, which defeats the reason this input exists. A typo surfaces only as a
+  pod stuck in `CreateContainerConfigError`, not as a Terraform error.
+
+### Compatibility
+
+- **AWS provider:** `~> 6.0`.
+- **Helm provider:** `~> 3.0`.
+- **Kubernetes provider:** `~> 2.0`.
+- **Terraform CLI:** `>= 1.11` (raised from `>= 1.9`; see upgrade note under
+  **Fixed**).
+- **n8n Helm chart:** default `1.10.0`. Other chart versions can be selected
+  via `n8n_chart_version`.
+- **Kubernetes:** validated on EKS `1.35`.
+- **PostgreSQL:** validated on RDS `18.4` (raised from `16.9`; see upgrade
+  note under **Changed**).
+
+### Known limitations
+
+- On `create_eks = false` + `create_ingress = true`, `install_lbc = false` is
+  hard-rejected with no exception for an existing cluster that already runs a
+  healthy Load Balancer Controller. Documented as a known limitation rather
+  than fixed in this release; see
+  [`docs/customer-managed-infrastructure.md`](./docs/customer-managed-infrastructure.md).
+- Nodes loaded via `n8n_custom_extensions_path` register as `CUSTOM.<node>`
+  rather than `<npm-package>.<node>`, so workflows built against a
+  UI-installed copy of the same community package will not resolve. Suits new
+  deployments rather than migrating one that already uses community nodes.
+- `examples/customer-managed-cluster` and `examples/customer-managed-everything`
+  have no full-plan `terraform test` coverage: `data.aws_eks_cluster.existing`
+  cannot resolve to a known value under mocked providers once nested inside an
+  example's own `module "n8n"` call.
+- See [README.md → Out of scope](./README.md#out-of-scope) for what this
+  release explicitly does not cover.
+
+## [0.2.0] - 2026-07-15
+
+Minor release per the [stability contract](./README.md#stability--versioning):
+the AWS and Helm provider floor bumps below are breaking for callers pinned
+to the previous majors. Pin this module to `~> 0.1.0` to stay on the old
+providers, or retype your constraint to `~> 0.2.0` and read the upgrade notes
+under **Changed**.
+
+### Added
+
+- `n8n_reinstall_missing_packages` input variable: sets
+  `N8N_REINSTALL_MISSING_PACKAGES` on all n8n pods so workers reinstall
+  UI-installed community packages after being rescheduled onto a fresh
+  filesystem. Defaults to false (env var omitted).
+- `n8n_community_packages_prevent_loading` input variable: sets
+  `N8N_COMMUNITY_PACKAGES_PREVENT_LOADING` on all n8n pods to stop installed
+  community packages from loading at runtime. Defaults to false (env var
+  omitted).
+- OpenTelemetry tracing toggles: `n8n_otel_enabled` (master switch, default
+  off) plus null-default tuning inputs `n8n_otel_exporter_otlp_endpoint`,
+  `n8n_otel_exporter_otlp_headers` (sensitive), `n8n_otel_exporter_service_name`,
+  `n8n_otel_traces_sample_rate` (validated 0–1), `n8n_otel_traces_include_node_spans`,
+  `n8n_otel_traces_inject_outbound`, and `n8n_otel_traces_production_only`. Wired
+  to the `N8N_OTEL_*` env vars on the Helm release's `config.extraEnv` so they
+  apply to every n8n container (main, worker, webhook processor). A `check` block
+  warns at plan time when a tuning var is set while `n8n_otel_enabled = false`.
+  When disabled (the default) no `N8N_OTEL_*` env vars are emitted.
+- `n8n_templates_enabled` input variable: defaults to true. When false, sets
+  `N8N_TEMPLATES_ENABLED=false` on all n8n pods to disable workflow templates
+  and template suggestions for deployments that enforce consistent workflows.
+- `n8n_personalization_enabled` input variable: defaults to true. When false,
+  sets `N8N_PERSONALIZATION_ENABLED=false` on all n8n pods to skip n8n's
+  personalization survey questions and tailored content/recommendations,
+  e.g. on shared or ephemeral instances.
+- Log streaming (Enterprise) managed via env vars: `n8n_log_streaming_managed_by_env`
+  (master switch, default off) and `n8n_log_streaming_destinations` (sensitive list of
+  webhook/syslog/sentry destination objects, JSON-encoded into
+  `N8N_LOG_STREAMING_DESTINATIONS`). Uses n8n's settings-env-vars activation pattern
+  (requires n8n >= 2.19.0): destinations are reapplied on every startup and the Log
+  Streaming UI becomes read-only. A `check` block warns at plan time when destinations
+  are set while the master switch is off. When disabled (the default) no
+  `N8N_LOG_STREAMING_*` env vars are emitted.
+- `n8n_image_tag` input variable: optional string (default `null`) that pins the n8n
+  application image to a specific version (e.g. `"1.2.3"`). When `null`, the Helm
+  chart's own default applies (currently the floating `stable` tag), so existing
+  deployments see no change. Validated at plan time against Docker tag rules
+  (`^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$`) to catch malformed or whitespace-padded
+  values before deployment. Pinning a concrete version is recommended for production
+  to avoid crossing major-version boundaries (e.g. n8n 2.0 breaking changes) on an
+  unplanned pod reschedule.
+- `n8n_extra_env` input variable: accepts a list of `{name, value}` objects appended
+  to the Helm chart's `config.extraEnv` after all module-managed env vars, letting
+  callers inject arbitrary n8n environment variables without forking the module.
+  Validated at plan time to reject empty or whitespace-padded names, duplicate
+  names, and any connection/identity/storage/license/topology variable the
+  module or chart manages: names starting with `DB_`, `QUEUE_`, `N8N_RUNNERS_`,
+  `N8N_EXTERNAL_STORAGE_S3_`, `N8N_MULTI_MAIN_`, or `AWS_`, plus exact names like
+  `N8N_ENCRYPTION_KEY`, `N8N_LICENSE_ACTIVATION_KEY`, `WEBHOOK_URL`, and
+  `EXECUTIONS_MODE`. `config.extraEnv` is appended last, so without this guard a
+  caller could silently override those (Kubernetes last-wins) and break the
+  deployment. Not intended for secrets: values are stored in plaintext in
+  Terraform state; pass a `*_FILE` companion pointing at a mounted secret instead.
+- EBS CSI driver (EKS managed addon) and a default encrypted `gp3` StorageClass
+  (`storage.tf`), so PersistentVolumeClaims without an explicit `storageClassName`
+  bind out of the box instead of staying `Pending` forever
+  ([#22](https://github.com/n8n-io/terraform-aws-n8n/issues/22)). The CSI
+  controller authenticates via EKS Pod Identity (no IRSA/OIDC), scoped to the
+  AWS-managed `AmazonEBSCSIDriverPolicy`; volumes are encrypted with the default
+  `aws/ebs` key. Additive for existing deployments: the next apply installs the
+  addon and the StorageClass without cycling any n8n pods. The EKS-created legacy
+  `gp2` class is left untouched (not Terraform-managed, carries no default
+  annotation on current EKS). Decision record: solutions-catalog ADR-0041.
+
+### Changed
+
+- **AWS provider requirement bumped to `~> 6.0`** (was `~> 5.0`). No module
+  resource required a configuration change: the module surface uses none of the
+  attributes removed in AWS provider 6.0, and `terraform validate` passes
+  against 6.x. Upgrade note: AWS provider 6.0 adds a per-resource `region`
+  attribute, so existing v0.1.x deployments should run
+  `terraform plan -refresh-only` followed by `terraform apply -refresh-only` to
+  settle state before applying further changes. Callers who must remain on AWS
+  provider 5.x should pin this module to `~> 0.1.0`.
+- **Helm provider requirement bumped to `~> 3.0`** (was `~> 2.12`). Helm
+  provider 3.0 is a Plugin Framework rewrite. The `set` blocks on the bundled
+  controller releases (AWS Load Balancer Controller, Cluster Autoscaler,
+  metrics-server) were converted to the new `set = [...]` list syntax, and the
+  example `provider "helm"` blocks now use the `kubernetes = { ... }` object
+  form. Upgrade note: drift detection is stricter in 3.x, so the first
+  `terraform plan` after upgrading may show in-place diffs on existing
+  `helm_release` resources. Callers who must remain on Helm provider 2.x should
+  pin this module to `~> 0.1.0`.
+- **Default `n8n_chart_version` bumped to `1.10.0`** (was `1.4.0`). Applying
+  this default change cycles the n8n pods. Pin `n8n_chart_version` to stay on a
+  specific chart release. Validated by a real apply of examples/small plus the
+  post-deploy smoke test.
+
+### Compatibility
+
+- **AWS provider:** `~> 6.0` (see upgrade note under **Changed**).
+- **Helm provider:** `~> 3.0` (see upgrade note under **Changed**).
+- **Kubernetes provider:** `~> 2.0`.
+- **Terraform CLI:** `>= 1.9`.
+- **n8n Helm chart:** validated against `1.10.0` (the current default) via a
+  real apply of `examples/small` plus the post-deploy smoke test. Newer chart
+  versions can be selected via `n8n_chart_version` but are not part of the
+  v0.2.0 test matrix.
+- **Kubernetes:** validated on EKS 1.35.
+- **PostgreSQL:** validated on RDS `16.9`.
+
+### Known limitations
+
+- Checkov still runs in `soft_fail` mode; findings are surfaced but do not
+  block CI. The curated suppressions and flip to hard-fail announced in
+  v0.1.0 are deferred to a later release.
+- See [README.md → Out of scope](./README.md#out-of-scope) for what this
+  release explicitly does not cover.
+
+## [0.1.0] - 2026-06-04
+
+Initial release on the Terraform Registry as `n8n-io/n8n/aws`.
+
+### Added
+
+- Production-grade multi-main n8n Enterprise deployment on AWS: EKS
+  cluster with managed node group; multiple n8n main pods, dedicated
+  worker pods (queue mode), and webhook-processor pods; RDS for
+  PostgreSQL; ElastiCache for Redis; S3 wired via EKS Pod Identity for
+  shared binary storage.
+- AWS Load Balancer Controller, Cluster Autoscaler, KEDA (queue-driven
+  worker scaling), and metrics-server installed via Helm.
+- Route 53 path: end-to-end automation, pass `route53_zone_id` and the
+  module issues the ACM certificate and creates the DNS alias record
+  itself.
+- Cloudflare and GoDaddy paths via the respective examples, which issue
+  the certificate themselves and pass the validated `certificate_arn`
+  to the module.
+- Five runnable examples: `small` (defaults), `medium`, `large` (adds
+  Aurora, PgBouncer, dual-NAT-GW HA, VPC CNI tuning), `cloudflare`,
+  `godaddy`.
+- Prometheus metrics endpoint toggle via `n8n_metrics_enabled` (off by
+  default; scrape configuration left to the caller's monitoring stack).
+- Plan-time `terraform test` suites at the module root and on each
+  example, with mocked providers so the suite runs without AWS
+  credentials.
+
+### Compatibility
+
+- **AWS provider:** `~> 5.0` (does not yet support `~> 6.0`; tracked for
+  v0.2.0).
+- **Helm provider:** `~> 2.12` (does not yet support `~> 3.0`; tracked
+  for v0.2.0).
+- **Kubernetes provider:** `~> 2.0`.
+- **Terraform CLI:** `>= 1.9`.
+- **n8n Helm chart:** validated against `1.4.0` (the current default).
+  Newer chart versions can be selected via `n8n_chart_version` but are
+  not part of the v0.1.0 test matrix; bump tracked for v0.2.0.
+- **Kubernetes:** validated on EKS 1.35.
+- **PostgreSQL:** validated on RDS `16.9`.
+
+### Known limitations
+
+- See [README.md → Out of scope](./README.md#out-of-scope) for what this
+  release explicitly does not cover (VPC creation, multi-region,
+  GovCloud, air-gapped, backup/DR automation beyond RDS snapshots,
+  bundled observability).
+- v0.1.0's AWS infrastructure creation path was validated against
+  `examples/small` (a full `terraform apply` provisioned EKS, RDS with
+  CMK encryption, ElastiCache, S3, ACM, Route 53, IAM, KMS, the LBC /
+  Cluster Autoscaler / metrics-server / KEDA controllers, and the n8n
+  Helm release reached the licensing layer; AWS resources destroyed
+  cleanly with no orphans). The end-to-end smoke test in
+  `tests/scripts/smoke-test.sh` was not run against a fully Ready n8n
+  install for this release. Other examples pass plan-time mocked tests
+  but were not real-applied. A full end-to-end validation cycle
+  including the smoke test is tracked for v0.2.0.
+- Checkov runs in `soft_fail` mode; findings are surfaced but do not
+  block CI. Curated suppressions and a flip to hard-fail are tracked
+  for v0.2.0.
+
+[Unreleased]: https://github.com/n8n-io/terraform-aws-n8n/compare/0.6.0...HEAD
+[0.6.0]: https://github.com/n8n-io/terraform-aws-n8n/compare/0.5.0...0.6.0
+[0.5.0]: https://github.com/n8n-io/terraform-aws-n8n/compare/0.4.0...0.5.0
+[0.4.0]: https://github.com/n8n-io/terraform-aws-n8n/compare/0.3.0...0.4.0
+[0.3.0]: https://github.com/n8n-io/terraform-aws-n8n/compare/0.2.0...0.3.0
+[0.2.0]: https://github.com/n8n-io/terraform-aws-n8n/compare/0.1.0...0.2.0
+[0.1.0]: https://github.com/n8n-io/terraform-aws-n8n/releases/tag/0.1.0

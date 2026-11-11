@@ -1,0 +1,156 @@
+# Cloudflare DNS example
+
+End-to-end deployment of the `terraform-aws-n8n` module, including the VPC it depends on, using Cloudflare for DNS and ACM certificate validation. Use this example when your domain is managed in Cloudflare rather than Route53.
+
+## What it creates
+
+- VPC with public and private subnets across two AZs, NAT gateway, EKS/ALB subnet tags (via `terraform-aws-modules/vpc/aws`)
+- Everything the `terraform-aws-n8n` module creates: the ACM certificate (DNS-validated via Cloudflare), the CNAME record for `n8n_domain` pointing at the ALB, EKS cluster, managed node group, RDS PostgreSQL, ElastiCache Redis, S3 bucket, AWS Load Balancer Controller, Cluster Autoscaler, metrics-server, KEDA, and the n8n Helm release
+
+## Prerequisites
+
+- A Cloudflare zone for the parent domain (e.g. `example.com` if `n8n_domain = n8n.example.com`). Note the **Zone ID** from the Overview page in the Cloudflare dashboard.
+- A Cloudflare API token with **Zone:DNS:Edit** permission scoped to that zone. Create one at https://dash.cloudflare.com/profile/api-tokens.
+
+## Apply
+
+```bash
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars and set n8n_domain, cloudflare_zone_id,
+# cloudflare_api_token, and n8n_license_key
+
+terraform init
+terraform apply -compact-warnings
+```
+
+Terraform provisions the VPC, issues the ACM certificate (validating it automatically via Cloudflare DNS records), stands up EKS and everything on top, and creates the CNAME pointing `n8n_domain` at the ALB. Allow ~5 minutes after apply for the ALB to become reachable.
+
+## Cloudflare proxy
+
+The CNAME record is created with `proxied = false` by default so that ACM certificate renewal and ALB health checks work without Cloudflare-specific configuration. To route traffic through Cloudflare's proxy (for DDoS protection and CDN), set `proxied = true` on `cloudflare_record.n8n_cname` in `dns.tf` **and** set your Cloudflare SSL/TLS mode to **Full (strict)**.
+
+Cloudflare's proxy adds its own `X-Forwarded-For` entry, so with `proxied = true` also set `n8n_proxy_hops = 2`. With the default of 1, n8n records Cloudflare's edge IPs as the client IPs. Restrict the ALB to [Cloudflare's published IP ranges](https://www.cloudflare.com/ips/) as well, with the module's `alb_inbound_cidrs` input, which this example does not pass through (add it in `main.tf`). Otherwise a caller that reaches the ALB directly can forge `X-Forwarded-For` and spoof its client IP. See the [TLS proxy guide](../../docs/tls-proxy.md).
+
+## Multiple hostnames
+
+This example issues its own single-Common-Name ACM certificate in `dns.tf`
+and does not pass through the module's `n8n_additional_domains` input. That
+input only reaches the certificate on the module's own Route 53 issuance
+path (`route53_zone_id` set): with this example's caller-supplied
+`certificate_arn`, the module cannot add subject alternative names to a
+certificate it did not issue, and its `dns.tf` warns if you try. If n8n
+needs to answer on more than one hostname, use `examples/small` (Route 53),
+or extend this example: request a certificate in `dns.tf` whose subject
+alternative names cover every hostname, widen the `for_each` on
+`cloudflare_record.cert_validation` from `toset([var.n8n_domain])` to the
+full static set of names so every name gets a validation record (keep the
+lookup keyed by domain name; iterating `domain_validation_options` directly
+fails at plan because its keys are unknown, as the comment in `dns.tf`
+explains), add a CNAME per hostname, and pass the extra names through to
+the module's `n8n_additional_domains`, which adds the Ingress rules. The module's
+plan-time warning still fires in that setup because it cannot inspect the
+certificate you supplied; it is safe to ignore once the names match.
+
+## Post-deployment
+
+See [../../docs/post-deployment.md](../../docs/post-deployment.md) for activating your n8n Enterprise license.
+
+## Teardown
+
+```bash
+terraform destroy
+```
+
+## Production considerations
+
+This example is a reference deployment optimized for clean `apply` / `destroy` cycles during evaluation. The module ships with teardown-friendly defaults that you should review before promoting to production:
+
+| Module input | Current default | Production |
+|---|---|---|
+| `db_backup_retention_period` | `7` | Match your RPO (up to 35 days) |
+| `db_deletion_protection` | `false` | `true` |
+| `db_skip_final_snapshot` | `true` | `false`, plus set `db_final_snapshot_identifier` |
+| `db_delete_automated_backups` | `true` | `false` |
+| `s3_force_destroy` | `true` | `false` |
+
+These inputs are passed straight through to the module; set them in `terraform.tfvars` (or via any other variable source) to override the defaults. They no longer require wrapping or forking the module.
+
+See [`docs/build-time-decisions.md`](../../docs/build-time-decisions.md) for the module-level settings elsewhere in the root module that are fixed at the first `terraform apply`.
+
+<!-- The block below is auto-generated by terraform-docs. Run `terraform-docs markdown table --output-file README.md --output-mode inject .` to refresh it. -->
+<!-- BEGIN_TF_DOCS -->
+## Requirements
+
+| Name | Version |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.13 |
+| <a name="requirement_aws"></a> [aws](#requirement\_aws) | ~> 6.0 |
+| <a name="requirement_cloudflare"></a> [cloudflare](#requirement\_cloudflare) | >= 4.0.0, < 4.52.7 |
+| <a name="requirement_helm"></a> [helm](#requirement\_helm) | ~> 3.0 |
+| <a name="requirement_kubernetes"></a> [kubernetes](#requirement\_kubernetes) | ~> 3.0 |
+
+## Providers
+
+| Name | Version |
+| ---- | ------- |
+| <a name="provider_aws"></a> [aws](#provider\_aws) | ~> 6.0 |
+| <a name="provider_cloudflare"></a> [cloudflare](#provider\_cloudflare) | >= 4.0.0, < 4.52.7 |
+
+## Modules
+
+| Name | Source | Version |
+| ---- | ------ | ------- |
+| <a name="module_n8n"></a> [n8n](#module\_n8n) | ../.. | n/a |
+| <a name="module_vpc"></a> [vpc](#module\_vpc) | terraform-aws-modules/vpc/aws | ~> 5.0 |
+
+## Resources
+
+| Name | Type |
+| ---- | ---- |
+| [aws_acm_certificate.n8n](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/acm_certificate) | resource |
+| [aws_acm_certificate_validation.n8n](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/acm_certificate_validation) | resource |
+| [cloudflare_record.cert_validation](https://registry.terraform.io/providers/cloudflare/cloudflare/latest/docs/resources/record) | resource |
+| [cloudflare_record.n8n_cname](https://registry.terraform.io/providers/cloudflare/cloudflare/latest/docs/resources/record) | resource |
+| [aws_availability_zones.available](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/availability_zones) | data source |
+
+## Inputs
+
+| Name | Description | Type | Default | Required |
+| ---- | ----------- | ---- | ------- | :------: |
+| <a name="input_aws_partner_attribution_tag"></a> [aws\_partner\_attribution\_tag](#input\_aws\_partner\_attribution\_tag) | Value of the aws-apn-id tag added to every taggable AWS resource this example and the module create, so AWS Partner Revenue Measurement attributes their spend to n8n. Passed to the module's aws\_partner\_attribution\_tag and merged into this example's own tags, which is how the VPC, NAT gateway and any stand-in infrastructure get it. This input owns the tag: an aws-apn-id key in tags is ignored. Set to an empty string to remove the tag from resources Terraform manages and stop new load balancers and volumes receiving it; EBS volumes that already exist keep it. Keep the default and validation in sync with the module root's variables.tf. | `string` | `"pc:26au7o6cdeh7fqdt376h9m9xk"` | no |
+| <a name="input_aws_region"></a> [aws\_region](#input\_aws\_region) | AWS region to deploy into (e.g. us-east-1, eu-west-1, ap-southeast-1). | `string` | `"us-east-1"` | no |
+| <a name="input_cloudflare_api_token"></a> [cloudflare\_api\_token](#input\_cloudflare\_api\_token) | Cloudflare API token with Zone:DNS:Edit permission for the zone. Create one at https://dash.cloudflare.com/profile/api-tokens. Can also be supplied via the CLOUDFLARE\_API\_TOKEN environment variable. | `string` | n/a | yes |
+| <a name="input_cloudflare_zone_id"></a> [cloudflare\_zone\_id](#input\_cloudflare\_zone\_id) | Cloudflare zone ID for the domain that contains n8n\_domain. Find it on the Overview page of your zone in the Cloudflare dashboard. | `string` | n/a | yes |
+| <a name="input_cluster_name"></a> [cluster\_name](#input\_cluster\_name) | Name for the EKS cluster. Keep to 14 characters or fewer — the module derives an ElastiCache cluster ID of `<cluster_name>-redis`, and AWS caps ElastiCache IDs at 20 chars. Use only lowercase letters, digits and hyphens: the name is also used for the EKS cluster, which does not accept periods, and in the S3 bucket name `n8n-<cluster_name>-<id>`, which does not accept uppercase letters or underscores. The module rejects uppercase letters and underscores at plan time. | `string` | `"n8n-cluster"` | no |
+| <a name="input_db_backup_retention_period"></a> [db\_backup\_retention\_period](#input\_db\_backup\_retention\_period) | Number of whole days to retain automated RDS backups. A value of 0 disables automated backups and point-in-time recovery. Passed to the module's db\_backup\_retention\_period. Leave null (the default) to use the module's default of 7 days. | `number` | `null` | no |
+| <a name="input_db_delete_automated_backups"></a> [db\_delete\_automated\_backups](#input\_db\_delete\_automated\_backups) | Passed to the module's db\_delete\_automated\_backups. Leave null (the default) to use the module's teardown-friendly default of true. | `bool` | `null` | no |
+| <a name="input_db_deletion_protection"></a> [db\_deletion\_protection](#input\_db\_deletion\_protection) | Passed to the module's db\_deletion\_protection. Leave null (the default) to use the module's teardown-friendly default of false. | `bool` | `null` | no |
+| <a name="input_db_final_snapshot_identifier"></a> [db\_final\_snapshot\_identifier](#input\_db\_final\_snapshot\_identifier) | Passed to the module's db\_final\_snapshot\_identifier. Required when db\_skip\_final\_snapshot is false; must be left null otherwise, or the module rejects the plan. | `string` | `null` | no |
+| <a name="input_db_skip_final_snapshot"></a> [db\_skip\_final\_snapshot](#input\_db\_skip\_final\_snapshot) | Passed to the module's db\_skip\_final\_snapshot. Leave null (the default) to use the module's teardown-friendly default of true. | `bool` | `null` | no |
+| <a name="input_n8n_custom_extensions_path"></a> [n8n\_custom\_extensions\_path](#input\_n8n\_custom\_extensions\_path) | Absolute path inside the n8n container that n8n scans for custom nodes at startup (e.g. "/opt/n8n-nodes"). Maps to N8N\_CUSTOM\_EXTENSIONS, and is set on main, worker and webhook processor pods alike. Set this alongside n8n\_image\_repository when the custom image bakes community packages in: since n8n 1.0 the loader no longer reads the image's global node\_modules, so a plain npm install into the image is never scanned and the packages ship but never load. Nodes found here register under the package name CUSTOM, so a node installed from npm as n8n-nodes-example.myNode becomes CUSTOM.myNode and existing workflows referencing the npm-qualified type will not resolve. Leave null (the default) to omit the env var. | `string` | `null` | no |
+| <a name="input_n8n_domain"></a> [n8n\_domain](#input\_n8n\_domain) | Fully-qualified domain name for n8n (e.g. n8n.example.com). Must be a subdomain of the zone identified by cloudflare\_zone\_id, and 64 characters or fewer: this example uses it as the Common Name of the ACM certificate it issues, which RFC 5280 caps at 64 octets. | `string` | n/a | yes |
+| <a name="input_n8n_execution_data_storage_mode"></a> [n8n\_execution\_data\_storage\_mode](#input\_n8n\_execution\_data\_storage\_mode) | Where n8n stores the data of each new execution. Passed to the module's n8n\_execution\_data\_storage\_mode. "database" keeps execution data in PostgreSQL; "s3" offloads it to the S3 bucket the module already creates for binary data. This example runs the module's default database (db.t3.small on 50 GB of gp2, a 150 IOPS baseline), which has the least room of any sizing this module ships to absorb execution-data growth, so reaching for this is often cheaper than resizing the database. Requires n8n >= 2.27 (pin n8n\_image\_tag accordingly) and an Enterprise license carrying the feat:executionDataS3 entitlement, which is not the same one binary data offload uses. There is no backfill: existing executions stay readable where they were written. Read the execution data section of the root README before enabling it, in particular the durability trade-off and the S3 lifecycle constraint. | `string` | `"database"` | no |
+| <a name="input_n8n_extra_ca_pem"></a> [n8n\_extra\_ca\_pem](#input\_n8n\_extra\_ca\_pem) | Passed to the module's n8n\_extra\_ca\_pem: PEM CA certificate(s) trusted by the main, worker and webhook-processor pods for outbound TLS, for a TLS-inspecting egress proxy or a private CA; task-runner sidecars are not covered. Certificates only, never a private key. Leave null (the default) to add none. See [TLS proxy guide](../../docs/tls-proxy.md). | `string` | `null` | no |
+| <a name="input_n8n_extra_env"></a> [n8n\_extra\_env](#input\_n8n\_extra\_env) | Passed to the module's n8n\_extra\_env: extra environment variables for the n8n containers on every role (main, worker, webhook processor), not the task runner sidecars, e.g. HTTP\_PROXY, HTTPS\_PROXY and NO\_PROXY for an egress proxy. The module rejects names it manages. Values are stored in plaintext in Terraform state and the Helm release, so never embed credentials in a proxy URL (http://user:pass@proxy). See [TLS proxy guide](../../docs/tls-proxy.md). | <pre>list(object({<br/>    name  = string<br/>    value = string<br/>  }))</pre> | `[]` | no |
+| <a name="input_n8n_image_pull_secrets"></a> [n8n\_image\_pull\_secrets](#input\_n8n\_image\_pull\_secrets) | Names of existing Kubernetes secrets of type kubernetes.io/dockerconfigjson, in the n8n namespace, that the pods authenticate to their image registry with. Leave empty (the default) unless n8n\_image\_repository points somewhere the node group's IAM role cannot already reach: a public registry and an ECR repository in this account both pull without credentials. Setting it hands ownership of the n8n ServiceAccount from the Helm chart to the module, which is how the secrets reach the pods at all, since the pinned chart renders imagePullSecrets nowhere. Create and rotate the secrets yourself; the module takes names, not credentials, so none of them land in Terraform state. Cross-account ECR is the exception and should not use this: its authorization tokens expire after 12 hours, so add the node group role to the source repository's policy instead. | `list(string)` | `[]` | no |
+| <a name="input_n8n_image_repository"></a> [n8n\_image\_repository](#input\_n8n\_image\_repository) | Container image repository for the n8n application, without a tag (e.g. "123456789012.dkr.ecr.eu-west-1.amazonaws.com/n8n"). Leave null to use the Helm chart's own repository (docker.n8n.io/n8nio/n8n). Set this to run a custom image, for example one with community packages baked in so they are not reinstalled on every pod boot. The image must be pullable by the node group's IAM role (ECR in the same account is) or be public, otherwise name a dockerconfigjson secret in n8n\_image\_pull\_secrets, and n8n\_task\_runner\_image\_tag usually has to be set alongside it. | `string` | `null` | no |
+| <a name="input_n8n_image_tag"></a> [n8n\_image\_tag](#input\_n8n\_image\_tag) | n8n application image tag to deploy (e.g. "2.27.4"). Leave null to use the selected Helm chart's default (appVersion 2.43.5 in chart 1.16.0). Inspect and pin the running application version before upgrading the chart to avoid a downgrade; see the [upgrade guide](../../docs/upgrading-n8n.md). | `string` | `null` | no |
+| <a name="input_n8n_license_key"></a> [n8n\_license\_key](#input\_n8n\_license\_key) | n8n license activation key. Requires Enterprise with feat:multipleMainInstances by default; Business is supported with n8n\_main\_hpa\_min\_replicas = 1. Get one at https://n8n.io/pricing | `string` | n/a | yes |
+| <a name="input_n8n_main_hpa_min_replicas"></a> [n8n\_main\_hpa\_min\_replicas](#input\_n8n\_main\_hpa\_min\_replicas) | Minimum (and therefore default) replica count for n8n main pods, passed straight through to the module's own n8n\_main\_hpa\_min\_replicas. Leave null (the default) to use the module's default of 2 (multi-main, needs an Enterprise/Startup license carrying feat:multipleMainInstances). Set to 1 to run a single main pod in plain queue mode instead, which only needs a Business-tier license: n8n's multi-main leader-election gate never engages at 1 replica. | `number` | `null` | no |
+| <a name="input_n8n_proxy_hops"></a> [n8n\_proxy\_hops](#input\_n8n\_proxy\_hops) | Passed to the module's n8n\_proxy\_hops: number of proxies in front of n8n that add an X-Forwarded-For entry (the module's own ALB counts as 1, an additional proxy or WAF that adds its own entry makes 2). Turning on Cloudflare proxying (proxied = true on cloudflare\_record.n8n\_cname in dns.tf) adds such a hop, so set 2 and restrict the ALB to Cloudflare's published IP ranges. At any hop count of 1 or more, a caller that bypasses the declared proxy chain can forge X-Forwarded-For and spoof its client IP, including an in-cluster caller that reaches the n8n Services directly. When a proxy sits in front of the ALB, restrict the ALB to that proxy's egress addresses with the module's alb\_inbound\_cidrs or alb\_inbound\_prefix\_list\_ids input, which this example does not pass through (add it in main.tf), and keep in-cluster callers off the n8n Services. Leave null (the default) to use the module's default of 1. See [TLS proxy guide](../../docs/tls-proxy.md). | `number` | `null` | no |
+| <a name="input_n8n_task_runner_image_repository"></a> [n8n\_task\_runner\_image\_repository](#input\_n8n\_task\_runner\_image\_repository) | Container image repository for the task runner sidecar (n8nio/runners), without a tag or digest (e.g. "123456789012.dkr.ecr.eu-west-1.amazonaws.com/n8n-runners"). Leave null to use the Helm chart's own repository (n8nio/runners). Set alongside n8n\_image\_repository when mirroring both images into the same private registry; the two are independent. Use n8n\_task\_runner\_image\_tag for the runner tag. Private-registry pull access is granted the same way as n8n\_image\_repository, through n8n\_image\_pull\_secrets on the module-managed ServiceAccount. | `string` | `null` | no |
+| <a name="input_n8n_task_runner_image_tag"></a> [n8n\_task\_runner\_image\_tag](#input\_n8n\_task\_runner\_image\_tag) | Image tag for the task runner sidecar (`n8nio/runners`). Leave null to inherit the n8n application image's tag, which is correct as long as that tag is a published n8n version. Set it to the underlying n8n version when running a custom image whose tag is not one (e.g. n8n\_image\_tag = "2.27.4-mypackages" together with n8n\_task\_runner\_image\_tag = "2.27.4"); otherwise the sidecar image cannot be pulled and every pod carrying a runner stays in ImagePullBackOff (workers only in upstream chart 1.16.0 queue mode). | `string` | `null` | no |
+| <a name="input_s3_force_destroy"></a> [s3\_force\_destroy](#input\_s3\_force\_destroy) | Passed to the module's s3\_force\_destroy. Leave null (the default) to use the module's teardown-friendly default of true. | `bool` | `null` | no |
+| <a name="input_tags"></a> [tags](#input\_tags) | Additional AWS tags to apply to all resources this example creates. Merged on top of the built-in ManagedBy/Project tags. | `map(string)` | `{}` | no |
+
+## Outputs
+
+| Name | Description |
+| ---- | ----------- |
+| <a name="output_alb_hostname"></a> [alb\_hostname](#output\_alb\_hostname) | ALB hostname. The CNAME for n8n\_domain is already created in Cloudflare — this output is informational. |
+| <a name="output_db_password"></a> [db\_password](#output\_db\_password) | RDS PostgreSQL password — back this up in a password manager. |
+| <a name="output_kubectl_config_command"></a> [kubectl\_config\_command](#output\_kubectl\_config\_command) | Command to configure kubectl for this cluster. |
+| <a name="output_n8n_encryption_key"></a> [n8n\_encryption\_key](#output\_n8n\_encryption\_key) | n8n encryption key — back this up in a password manager. |
+| <a name="output_n8n_url"></a> [n8n\_url](#output\_n8n\_url) | URL to access n8n once the ALB finishes provisioning (~5 min after apply). |
+| <a name="output_namespace"></a> [namespace](#output\_namespace) | Kubernetes namespace n8n is deployed into. Read by tests/scripts/smoke-test.sh. |
+<!-- END_TF_DOCS -->

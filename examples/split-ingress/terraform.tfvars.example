@@ -1,0 +1,90 @@
+# Copy this file to terraform.tfvars and fill in your values.
+
+# Hostname for the n8n editor UI. Served by the INTERNAL ALB: resolves to
+# private addresses, reachable only from inside the VPC or over VPN.
+n8n_domain = "n8n.example.com"
+
+# Route53 hosted zone ID for the parent domain (e.g. example.com). This example
+# issues one ACM certificate covering both hostnames, validates it, and writes
+# both alias A-records here: single terraform apply, no manual DNS steps.
+route53_zone_id = "Z0123456789ABCDEFGHIJ"
+
+# n8n license activation key. Get one at https://n8n.io/pricing. Enterprise
+# (feat:multipleMainInstances) for the default multi-main topology; Business is
+# enough with n8n_main_hpa_min_replicas = 1 (see below).
+n8n_license_key = "your-license-key-here"
+
+# Label prepended to n8n_domain for the PUBLIC webhook host. The default gives
+# hooks.n8n.example.com, served by the internet-facing ALB.
+# webhook_subdomain = "hooks"
+
+# WAFv2 web ACL for the public webhook ALB. Must be scope = REGIONAL and in the
+# same region. This is the main payoff of splitting the ALBs: rate limits and
+# managed rule groups apply to untrusted traffic only.
+# waf_acl_arn = "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/n8n-webhooks/abc-123"
+
+# Restrict the internal admin ALB further: your VPN pool or bastion range.
+# Empty allows anything that can route to the private subnets.
+# admin_allowed_cidr_blocks = ["10.20.0.0/16"]
+
+# AWS region. Change if you're deploying outside us-east-1.
+# aws_region = "eu-west-1"
+
+# EKS cluster name. Keep to 14 characters or fewer: ElastiCache cluster IDs
+# derived from this name are capped at 20 chars, and '-redis' consumes 6.
+# cluster_name = "n8n-cluster"
+
+# Pin a concrete n8n version instead of the chart's floating `stable` tag.
+# n8n_image_tag = "2.33.1"
+
+# Extra AWS tags applied to every resource this example creates.
+# tags = {
+#   Environment = "production"
+#   Owner       = "platform-team"
+# }
+
+# Where n8n stores execution data. Default "database" keeps it in PostgreSQL.
+# "s3" offloads every new execution to the bucket the module already creates for
+# binary data. This example runs the module's default db.t3.small on 50 GB of gp2
+# with a 150 IOPS baseline, the least room of any sizing this module ships, so
+# reach for this before resizing the database. It needs n8n >= 2.27 (see the
+# n8n_image_tag pin above) and an Enterprise license with the feat:executionDataS3
+# entitlement, and it does not backfill: existing executions stay readable where
+# they were written. Read the execution data section of the root README first,
+# including the durability trade-off (the bucket has no backups and no
+# versioning) and the S3 lifecycle constraint.
+# n8n_execution_data_storage_mode = "s3"
+
+# Minimum (and default) replica count for n8n main pods. Leave commented to
+# use the module's default of 2 (multi-main, needs an Enterprise/Startup
+# license carrying feat:multipleMainInstances). Set to 1 to run single-main
+# in plain queue mode instead, which only needs a Business-tier license.
+# n8n_main_hpa_min_replicas = 1
+
+# Egress through a TLS-inspecting proxy. See docs/tls-proxy.md. Reaches the
+# n8n containers only, not the task runner sidecars. Never embed credentials
+# in a proxy URL: the values are stored in plaintext in Terraform state and
+# the Helm release.
+# n8n_extra_ca_pem = <<-EOT
+#   -----BEGIN CERTIFICATE-----
+#   ...
+#   -----END CERTIFICATE-----
+# EOT
+# n8n_extra_env = [
+#   { name = "HTTP_PROXY", value = "http://proxy.example.com:3128" },
+#   { name = "HTTPS_PROXY", value = "http://proxy.example.com:3128" },
+#   { name = "NO_PROXY", value = ".svc,.cluster.local,169.254.170.23" },
+# ]
+
+# Inbound only: a proxy in front of both of this example's own ALBs
+# (create_ingress = false) that adds its own X-Forwarded-For entry. Leave
+# unset (the default 1) for egress-only setups. n8n_proxy_hops applies to
+# every n8n pod, so both ALBs need the same hop count. A WAF attached to the
+# public ALB via waf_acl_arn does not add a hop.
+# A caller that bypasses the declared proxy can forge X-Forwarded-For at any
+# hop count of 1 or more, including an in-cluster caller reaching the n8n
+# Services directly.
+# admin_allowed_cidr_blocks restricts only the internal editor ALB; restricting
+# the public webhook ALB to the proxy needs an inbound-cidrs annotation on its
+# Ingress in ingress.tf.
+# n8n_proxy_hops = 2

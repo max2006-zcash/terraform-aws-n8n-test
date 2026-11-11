@@ -1,0 +1,414 @@
+# Version currency policy
+
+This module pins a lot of versions: the n8n chart and image, four controller
+charts, five Terraform providers, the Terraform CLI floor, `kubernetes_version`,
+two database engines, and the CI toolchain that gates every PR. Each pin was
+deliberate at the time it was set, and each one can go stale the moment
+upstream ships a new release. This doc is the inventory of every pin, where it
+lives, and the bump policy for keeping it current on a cadence instead of
+waiting for a user to report a version nobody re-checked.
+
+## Inventory
+
+| Pin | Lives in | Tier |
+| --- | --- | --- |
+| `aws` provider constraint | `versions.tf`/`providers.tf` (root, `modules/controllers`, every `examples/*`; `examples/cloudflare` and `examples/godaddy` declare it in `providers.tf`, the rest in `versions.tf`) | Patch-safe |
+| `kubernetes` provider constraint | same 12 files | Verification-required |
+| `helm` provider constraint | same 12 files | Verification-required |
+| `random` provider constraint | `versions.tf` (root, `examples/large`) | Patch-safe |
+| `time` provider constraint | `versions.tf` (root only) | Patch-safe |
+| `required_version` (Terraform CLI floor) | 13 `versions.tf`/`providers.tf` files: root, `modules/controllers`, and every `examples/*` | Verification-required. Must stay equal to `TF_FLOOR_VERSION` (below) |
+| `n8n_chart_version` default | `variables.tf` | Minor-required |
+| `lbc_chart_version`, `cluster_autoscaler_chart_version`, `metrics_server_chart_version`, `keda_chart_version` defaults | `variables.tf` | Minor-required |
+| `kubernetes_version` default | `variables.tf`, and independently in `examples/customer-managed-cluster` and `examples/customer-managed-everything` | Verification-required (stays `1.35`; see below for why `1.36` isn't a currency gap) |
+| `db_engine_version` default | `variables.tf` | Minor-required |
+| `customer_managed_db_engine_version` default | `examples/customer-managed-everything/variables.tf` | Minor-required (follows the root default) |
+| `aurora_engine_version` local | `examples/large/aurora.tf` | Verification-required (Aurora's supported-version list is not the same list as RDS instance Postgres; confirmed current at `18.4`, see below) |
+| Redis engine version (`redis.tf`, hardcoded `"7.1"`) | `redis.tf` | Verification-required (`7.1` is the ceiling for Redis OSS on ElastiCache; anything newer is Valkey-only, a different engine family, out of scope for a version-currency pass) |
+| EKS add-on versions (Pod Identity Agent, EBS CSI, and vpc-cni when `eks_network_policy_enabled = true`) | `eks.tf`, `modules/controllers/storage.tf` | Not pinned at all: `aws_eks_addon` omits `addon_version`, so AWS selects its default version for the cluster's Kubernetes version when the add-on is created. Terraform does not upgrade it on later applies. This is a deliberate design choice, not an oversight, and there is nothing to bump |
+| `TF_VERSION`, `TFLINT_VERSION`, `CHECKOV_VERSION` | `.github/workflows/terraform-tests.yml` | Verification-required (`CHECKOV_VERSION` doubles as the pin `tests/scripts/check-checkov.sh` enforces locally) |
+| `TF_FLOOR_VERSION` (`test-floor` job) | `.github/workflows/terraform-tests.yml` | Not bumped on its own: always `X.Y.0` for a `required_version = ">= X.Y"` floor, the lowest release the floor admits. Moves only when the floor moves, in the same commit. `tests/scripts/check-terraform-floor.sh` (`task terraform-floor`) fails CI if the two disagree. `check-version-drift.sh` does not report it, because it is not meant to track the latest Terraform |
+| `MARKDOWNLINT_VERSION` (markdownlint job) | `.github/workflows/terraform-tests.yml` | Patch-safe, but keep in step with the `brew install markdownlint-cli` default contributors use locally, for the same reason as `TERRAFORM_DOCS_VERSION` |
+| `TERRAFORM_DOCS_VERSION` (docs job) | `.github/workflows/terraform-tests.yml` | Patch-safe, but keep in step with the `brew install terraform-docs` default contributors use locally (see `AGENTS.md`) |
+| Helm CLI version (the `azure/setup-helm` `version` input, `chart` and `chart-coverage` jobs) | `.github/workflows/terraform-tests.yml` | Patch-safe. Keep both jobs on the same version; `check-version-drift.sh` reports an `ERROR` when they differ |
+| `docs/helm-chart-coverage.md`'s declared chart version | `docs/helm-chart-coverage.md` | Must equal `n8n_chart_version`'s default; CI-gated by `tests/scripts/check-helm-chart-coverage.sh` |
+
+## Bump tiers
+
+**Patch-safe.** A newer patch/minor release with no known breaking change and
+no plan-time diff for existing deployments. Bump in the same PR as any other
+change, or standalone with a one-line CHANGELOG entry. No re-verification
+beyond the normal `terraform test`/`tflint`/`checkov` loop.
+
+**Minor-required.** Moves a default that changes what `terraform apply`
+deploys. A caller that never set the corresponding variable in their own
+`module` block is not shielded by that omission: Terraform resolves the
+variable to the module's new default on that caller's very next apply, with
+no config change of their own. For a chart version that means an in-place
+`helm upgrade` that rolls the release's pods. For `db_engine_version` it
+does not move the running instance: `aws_db_instance.n8n` ignores changes to
+`engine_version` (`auto_minor_version_upgrade` owns the live minor), so only
+a fresh database and the opt-in parameter group's `family` read it. Only a
+caller that explicitly pins the variable in their own configuration is
+unaffected either way. This
+module is still pre-1.0 either way, and the [stability
+contract](../README.md#stability--versioning) treats a changed default as a
+minor-version-boundary change regardless. Needs: a CHANGELOG entry under
+**Changed** naming the old and new value and stating plainly that unpinned
+callers move too, a `docs/helm-chart-coverage.md` re-verification when it's
+the n8n chart (see that doc's own instructions; `task chart-diff
+CANDIDATE=<version>` prints the `values.yaml` diff that re-verification
+starts from), and a passing
+`tests/scripts/check-main-chart.sh` when it's a chart this module templates
+against. For a controller chart, also compare the new `appVersion`'s
+supported Kubernetes range against every `kubernetes_version` this module
+accepts, not only the default: metrics-server chart `3.14.0` moved the
+floor from `1.31` to `1.34` in a chart minor, which the CHANGELOG has to
+say and the variable description has to carry.
+
+**Verification-required.** A provider major, the Terraform CLI floor, or
+`kubernetes_version`. These carry real breaking-change risk (see the Kubernetes
+provider 3.0 entry in `README.md`'s Compatibility section for a worked
+example) and are release-sized work in their own right, matching this
+project's past provider bumps (see `CHANGELOG.md`'s `v0.2.0` entry). Needs, at
+minimum: the upstream release's own upgrade guide read in full, a plan-time
+diff against every affected resource, an updated `README.md` Compatibility
+entry with an upgrade note, and a CHANGELOG entry. A resource-type rename this
+provider bump exposes (e.g. an unversioned-to-`_v1` Kubernetes resource) is
+**not** bumped reflexively: check first whether the provider supports a
+`moved` block across that specific rename (it does not, as of Kubernetes
+provider 3.2.1, for the unversioned-to-`_v1` family: see
+`terraform-provider-kubernetes` issue #2812). Without one, renaming the
+resource type in source forces every existing deployment to destroy and
+recreate whatever the module already manages under that address (a namespace,
+in this module's case, taking everything inside it down too), which is worse
+than living with the provider's deprecation warning until it ships that
+support.
+
+## Chart 1.12.0 upgrade requirements
+
+The default moves from `1.11.0` to `1.12.0`, so this belongs in a minor
+module release. `n8n_image_tag = null` still delegates to the selected chart,
+whose fallback changes from floating `stable` to `appVersion: 2.39.6`.
+An existing deployment may already run a newer application. Inspect and pin
+its running version before changing the chart; see
+[Upgrading n8n](./upgrading-n8n.md#moving-from-chart-1110-to-1120).
+
+Rendering tests cover fallback and explicit image tags, custom repositories,
+and worker-only task runners in queue mode. The capacity model removes main
+runner requests for upstream `1.12.0`, `1.13.0`, `1.14.0`, `1.15.0` and `1.16.0`, ignoring build metadata
+but not prerelease suffixes. Verify topology before extending that
+exception to any other release or repository. Worker pools still require
+their separate preview or verified custom chart.
+
+## Chart 1.13.0 upgrade requirements
+
+The default moves from `1.12.0` to `1.13.0`. `n8n_image_tag = null` still
+delegates to the selected chart, whose fallback moves from `appVersion:
+2.39.6` to `appVersion: 2.40.5`; inspect and pin the running application
+version first if it is not already pinned. See
+[Upgrading n8n](./upgrading-n8n.md#moving-from-chart-1120-to-1130).
+
+Upstream stops setting worker (and, where configured, webhook-processor)
+`replicas` once an autoscaler owns the count (n8n-io/n8n-hosting#201). This
+module's worker deployment always meets that condition, because the module
+floors `queueMode.workerReplicaCount` at 1. The first `helm upgrade` to
+`1.13.0` therefore removes `spec.replicas` from the worker Deployment, and
+Kubernetes defaults it to 1. The target is always 1, not the configured
+floor, so for a deployment running more than 1 worker, surplus pods start
+terminating and running executions can be interrupted once a pod's
+shutdown window ends. On a healthy, unpaused installation, the HPA that KEDA
+manages is expected to restore the floor; `keda.worker.pollingInterval`
+does not set that HPA's reconciliation interval. This is a release-note item, not a
+Terraform input change; see
+[Upgrading n8n](./upgrading-n8n.md#moving-from-chart-1120-to-1130) for the
+mitigations. This behavior is derived from the chart templates and from how
+Helm and Kubernetes handle a removed field. The live validation of this
+bump ran at a floor of 1, where the reset is not observable. Webhook
+processors are unaffected: their autoscaling is a Terraform-managed HPA in
+`scaling.tf`, outside the chart's KEDA/HPA model
+(`keda.webhookProcessor.enabled` is never set by this module).
+`tests/scripts/check-main-chart.sh` renders the worker Deployment with real
+(non-empty) KEDA triggers and asserts `replicas` is omitted, matching this
+module's actual shape rather than the chart's bare default.
+
+`n8n_worker_keda_pause` is supported from chart `1.13.0`, not `1.12.0` where
+the key first shipped, because `1.12.0` still sets the worker's
+`spec.replicas` on every upgrade and would override a held count. The
+version floor is a numeric major.minor compare in `scaling.tf`, so it does
+not need editing on future bumps.
+
+The new `keda.webhookProcessor.{pause,pausedReplicaCount,pollingInterval,
+cooldownPeriod,minReplicaCount,maxReplicaCount,triggers}` values (pausing
+webhook processors, including scale-to-zero) are not exposed by this
+module. Worker pools still require their separate preview or verified
+custom chart; this release carries no worker-pools change either way.
+
+## Chart 1.14.0 upgrade requirements
+
+The default moves from `1.13.0` to `1.14.0`. `n8n_image_tag = null` moves
+from `appVersion: 2.40.5` to `appVersion: 2.41.4`; pin first if unpinned. No
+Terraform input changes. The chart's removal of
+`N8N_AVAILABLE_BINARY_DATA_MODES` does not reach this module's pods, and
+1.13.0 → 1.14.0 also renamed the chart's `WEBHOOK_URL` ConfigMap key to
+`N8N_WEBHOOK_URL` without a release-note entry (n8n-io/n8n-hosting#184).
+The module sends neither deprecated name (except `WEBHOOK_URL` when the
+image tags do not prove n8n `2.30.0` or newer) and rejects both in its env
+inputs. The upgrade rolls every n8n pod once because the env list changes; see
+[Upgrading n8n](./upgrading-n8n.md#moving-from-chart-1130-to-1140).
+
+## Chart 1.15.0 upgrade requirements
+
+The default moves from `1.14.0` to `1.15.0`. `n8n_image_tag = null` moves from
+`appVersion: 2.41.4` to `appVersion: 2.42.4`; pin first if unpinned. No
+Terraform input changes. Only the chart's helpers, ConfigMap and NOTES
+templates changed, plus a new `extraObjects.yaml`; no `deployment-*.yaml`
+changed, so queue-mode main pods still carry no task-runner sidecar and the
+capacity model's worker-only accounting extends to `1.15.0`.
+
+The one change that reaches this module is n8n-io/n8n-hosting#175: the chart
+renders `database.ssl.enabled` as `DB_POSTGRESDB_SSL_ENABLED` instead of
+`DB_POSTGRESDB_SSL`. The module sets that name through `config.extraEnv`, and
+sends `database.ssl.*` only while a CA is delivered, so on the upstream chart
+at a numbered `1.15.0` or newer (prereleases excluded) it omits its own entry
+in exactly that case
+(`local.n8n_chart_renders_postgres_ssl_enabled`). Keeping its entry there would
+give every container the name twice; in every other case the chart does not
+render the name, or the module cannot verify that it does, so the module's
+entry stays. A bump that moves this gate, or a chart that renames the
+key again, is caught by `tests/scripts/check-main-chart.sh`, which counts the
+name per container with and without a CA. The mocked suites cannot catch it:
+`helm_release.values` is unknown under plan mocks.
+
+The same release's upgrade note, that `database.ssl.enabled: true` now actually
+negotiates TLS and verifies the certificate, does not affect this module,
+which never sets `database.ssl.enabled` without `database.ssl.ca`. See
+[Upgrading n8n](./upgrading-n8n.md#moving-from-chart-1140-to-1150).
+
+## Chart 1.16.0 upgrade requirements
+
+The default moves from `1.15.0` to `1.16.0`. `n8n_image_tag = null` moves from
+`appVersion: 2.42.4` to `appVersion: 2.43.5`; pin first if unpinned. The
+module sends the same Helm values on both charts, so the only differences are
+in what the chart itself renders:
+
+- n8n-io/n8n-hosting#228: the chart renders the main `PodDisruptionBudget`
+  only while main can run more than one replica, so single-main
+  (`n8n_main_hpa_min_replicas = 1`) loses the `minAvailable: 0` budget this
+  module still sends; multi-main keeps `minAvailable: 1`. That budget already
+  permitted every voluntary eviction, so this changes nothing observable.
+  `tests/scripts/check-main-chart.sh` renders both topologies and expects no
+  single-main PDB from `1.16.0`; `tests/scripts/smoke-test.sh` accepts either
+  shape for single-main.
+- n8n-io/n8n-hosting#223: the worker task-runner sidecar gains a liveness
+  probe on the launcher's `/healthz`, port 5680. The module sets nothing that
+  moves that port; `tests/scripts/check-main-chart.sh` asserts the probe.
+- n8n-io/n8n-hosting#229: more than one main now requires
+  `multiMain.enabled` and `license.enabled` at render time. Every
+  configuration this module accepts already satisfies both.
+- The task-runner sidecar moved into a shared `n8n.taskRunnerContainer`
+  template helper with the same placement and resources, so `1.16.0` joins
+  the capacity model's worker-only accounting above.
+- New, not exposed by this module: `editor.url`, `hostAliases`, image
+  digests, `persistence.annotations`, per-role `podSecurityContext` and
+  `containerSecurityContext`, and `secretRefs.env.N8N_ENCRYPTION_KEY_FILE`.
+
+See [Upgrading n8n](./upgrading-n8n.md#moving-from-chart-1150-to-1160).
+
+## Controller chart: AWS Load Balancer Controller 3.6.0
+
+`lbc_chart_version` moves from `3.5.0` to `3.6.0` (controller `v3.5.0` to
+`v3.6.0`). The chart's `templates/` are identical between the two, so the
+module's chart-level wiring (including the misspelled
+`webhookConfig.ingressValdationFailurePolicy` it overrides) is unchanged; only
+the controller image and the CRDs differ. Helm does not upgrade a chart's
+`crds/` directory, so existing clusters keep their current CRDs; the changes
+are one optional `TargetGroupBinding` field this module does not use and a
+Gateway API description. The chart declares no `kubeVersion`; the module's
+default Kubernetes `1.35` was the version exercised. Live behavior re-verified
+on `3.6.0` is listed in the `CHANGELOG`; the ALB behaviors documented
+elsewhere that were measured on `3.5.0` were not re-measured.
+
+## What this policy deliberately does not force
+
+- **Redis → Valkey.** AWS steers new ElastiCache deployments toward Valkey
+  over Redis OSS (see `redis.tf`'s comment on `engine_version`); as of Valkey
+  9.0 (May 2026) AWS's own guidance is "use Valkey unless you have a specific
+  reason not to," citing lower cost and higher throughput. That is an
+  engine-family change, not a version bump: `redis.tf` hardcodes
+  `engine = "redis"`, and Valkey is a distinct `engine` value with its own
+  version range, not a newer `"7.x"`. It needs its own migration path for
+  anyone already running this module's Redis engine (AWS's online migration
+  or a blue/green cutover, not a plan-time `engine_version` bump), a docs
+  rewrite, and a decision on whether the default changes for new deployments
+  or only becomes an option. Tracked as a separate, demand-driven issue
+  rather than folded into a version-currency PR.
+- **Aurora engine version in `examples/large`.** `aurora_engine_version` is
+  independent of the root module's `db_engine_version` (Aurora and RDS
+  instance Postgres are different engines with different supported-version
+  lists and different release cadences: Aurora typically lags upstream
+  PostgreSQL, and this repo's own history shows its exact minor has been
+  hand-verified against a live `aws rds describe-db-engine-versions --engine
+  aurora-postgresql` call, not inferred from a public announcement).
+  Confirmed still current as of this PR: AWS's own August 2026 announcement
+  ("Amazon Aurora now supports PostgreSQL 18.4, 17.10, 16.14, 15.18, and
+  14.23") lists `18.4` as the newest Aurora PostgreSQL 18 minor, so the
+  pinned value is not behind. Re-verify with the live `describe-*` call
+  before bumping past it rather than inferring the next minor from a blog
+  post; the account/region-scoped API is still the only source that proves
+  a specific minor is actually creatable, and public announcements lag or
+  stagger regional availability.
+- **`kubernetes_version` stays `1.35`, not `1.36`.** EKS made `1.36` generally
+  available June 2, 2026 (see AWS's own "what's new" announcement and
+  `docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html`), so
+  this is not a currency gap in the sense the other rows in this doc mean
+  it. It is a gate-compatibility gap instead: the pinned `checkov` 3.3.20
+  still hardcodes `CKV_AWS_339`'s allow-list at `["1.29", …, "1.35"]` with
+  no `1.36` entry (re-verified against 3.3.20's
+  [check source](https://github.com/bridgecrewio/checkov/blob/3.3.20/checkov/terraform/checks/resource/aws/EKSPlatformVersion.py)
+  when `CHECKOV_VERSION` moved from 3.3.19 to 3.3.20; the allow-list was
+  unchanged between those two releases), so bumping today would
+  add a curated-finding suppression for a version this repo's own security
+  gate cannot yet vouch for, while `1.35` remains inside AWS's 14-month
+  standard-support window. Revisit once a `checkov` release adds `1.36` to
+  that list; tracked in
+  [#158](https://github.com/n8n-io/terraform-aws-n8n/issues/158).
+  `tests/scripts/check-version-drift.sh` reads that allow-list at the pinned
+  `CHECKOV_VERSION` and checks it for the next minor above the pin. While
+  that minor is missing, the report lists `eks/kubernetes_version` under
+  "Known and expected (not actionable)" with its `isEol` flag and a link to
+  #158 instead of as drift. It applies the hold only when every input is
+  definite, and otherwise reports the line as `DRIFT` or `ERROR`:
+  - `isEol: true` (endoflife.date's flag for the end of EKS standard
+    support) is `DRIFT` marked `ACTIONABLE` on its own, because a pin
+    outside standard support outweighs the checkov gate.
+  - The pinned checkov allowing the next minor is `DRIFT` marked
+    `ACTIONABLE`.
+  - A newer checkov release allowing it is `DRIFT` marked `ACTIONABLE`, to
+    bump `CHECKOV_VERSION`, so the fix is visible before anyone makes it.
+  - An unreadable or unparseable EKS release list, `isEol` flag, or pinned
+    allow-list is an `ERROR` instead, so a network or format failure never
+    hides real drift. The one exception is a readable `isEol: true`, which
+    is `DRIFT` even when the rest is unreadable (first bullet). The allow-list must be one complete single-line
+    list literal; any other shape counts as unparseable. Only the optional
+    latest-checkov lookup may fail quietly, since the pinned answer alone
+    decides the hold.
+
+## Provider locks and toolchain updates
+
+The provider rows in the drift report compare constraints with upstream
+versions, not with the versions selected in `.terraform.lock.hcl`. Check
+all 13 tracked lock files: the root, eleven examples, and
+`modules/controllers`. A compatible provider update normally changes only
+its lock entries, not the module's constraints. Preserve checksums for
+`linux_amd64`, `linux_arm64`, and `darwin_arm64`, and leave unrelated
+providers unchanged. Consumers of the published module use their own root
+lock file, not this repository's locks.
+
+Checkov `3.3.19` adds `CKV_AWS_394`, which requires a `zone-name` or
+`zone-id` filter on `aws_availability_zones`. All eleven examples retain
+dynamic discovery so they remain runnable across regions without changing
+existing subnet placement in a toolchain update. Each data source carries
+a scoped exception, not a repository-wide suppression. This accepts a
+real risk: `slice(..., 0, 2)` limits the number of zones but does not pin
+their identities. Changes to the returned list can replace subnets. For a
+long-lived deployment, pin the existing zone identities in the VPC
+configuration and review the plan before applying. The published n8n
+module itself consumes a pre-existing VPC and performs no zone discovery.
+
+## What the automated drift report cannot see
+
+`tests/scripts/check-version-drift.sh` (run weekly by
+`.github/workflows/version-drift.yml`, and on demand via `task
+version-drift`) checks every pin reachable from a public API without AWS
+credentials: the five Terraform providers (registry.terraform.io, compared
+against each constraint rather than a single pinned version: any
+comma-separated combination of `~>`, `>=`, `>`, `<=`, `<`, `!=`, `=` or a
+bare version over numeric `N[.N[.N]]` versions, evaluated by
+`tests/scripts/lib/constraints.sh`, so a constraint that already admits the
+latest release reports `OK`, not drift; a prerelease or build-metadata
+version, in a constraint or as the latest release, is an explicit `ERROR`,
+and Terraform's rule that an exact constraint cannot be combined with
+another is not enforced, since Terraform validates `versions.tf` itself),
+the CI toolchain (GitHub releases, including
+`markdownlint-cli`), the four controller charts this module installs (their
+own chart repositories' `index.yaml`), the n8n chart (its own
+`oci://ghcr.io/n8n-io/n8n-helm-chart` registry's anonymous tag list, via a
+short-lived unauthenticated token and the Docker Distribution `tags/list`
+API, filtered to plain `X.Y.Z` release tags; a paginated response is an
+`ERROR`, since a truncated list could hide the newest release. ghcr.io does
+expose a public, unauthenticated tag index, and an earlier version of this doc and the script
+itself claimed otherwise and read `n8n-io/n8n-hosting`'s latest Git tag
+instead, which can also exist before the chart is actually published to
+GHCR), and `kubernetes_version` against EKS's supported-version list via
+`endoflife.date`'s public JSON API (an aggregator over AWS's own
+release-calendar docs; AWS itself does not publish this behind an API),
+cross-checked against checkov's `CKV_AWS_339` allow-list (see the
+`kubernetes_version` entry above).
+
+Each pin is classified `DRIFT` (behind upstream, or a provider constraint
+that no longer admits the latest release), `OK` (current, or a constraint
+that already admits the latest release), or `ERROR` (the upstream lookup
+failed, or this script cannot evaluate the pin's form, e.g. a provider
+constraint with an operator or a prerelease version that
+`tests/scripts/lib/constraints.sh` does not understand, or a latest provider
+release that is not a plain `X.Y.Z` version; these are reported explicitly
+rather than silently treated as current), closing with a one-line summary
+count of pins behind upstream and errors (an error is a failed lookup or a pin
+the script cannot evaluate, so it is not strictly a lookup-failure count). The
+`kubernetes_version` hold tracked in #158 is the one pin without a
+classification: it is not actionable, so it is listed separately under "Known
+and expected". The script exits 0 even when a lookup fails (it still exits 1 if
+`curl`, `jq` or `python3` is missing):
+`.github/workflows/version-drift.yml`'s only consumer of this output is an
+unguarded step with no `if: always()` that syncs it to a single tracking
+issue, and a non-zero exit here would make GitHub Actions skip that step
+entirely, silently stopping the tracking issue from ever reflecting a run
+that hit a lookup failure. Every `ERROR` is already visible in the synced
+report text, so a report, not a gate, is still the right contract here;
+revisit if that workflow step ever gains `if: always()`. One lookup does not
+report an `ERROR` when it fails: the optional lookup of the latest checkov
+release behind the #158 hold. The pinned checkov's `CKV_AWS_339` is what holds
+`kubernetes_version`, so the line stays under "Known and expected" and only
+that run's early warning, that a newer checkov release allows the next minor,
+is skipped.
+
+Even the EKS check only proves a version exists and its support window,
+not that it is creatable in one specific account and region right now;
+only `aws eks describe-cluster-versions`, run with credentials this repo's
+CI does not hold (see `AGENTS.md`: never apply from CI, no AWS secrets
+configured for any job here), answers that.
+
+It cannot see, and does not attempt to check, two things with no
+comparable public aggregator at the minor-version granularity that
+matters here:
+
+- **RDS PostgreSQL and ElastiCache Redis supported engine versions.**
+  AWS's release-notes pages and "what's new" posts are a reliable public
+  signal (this doc's `db_engine_version` and Redis entries above cite
+  them), but the account/region-scoped confirmation is
+  `aws rds describe-db-engine-versions` /
+  `aws elasticache describe-cache-engine-versions`, which need credentials
+  this repo does not carry in CI.
+- **Aurora's own PostgreSQL version list**, for the same reason, and
+  doubly so given it does not track RDS instance Postgres's list (see
+  above; this doc's `aurora_engine_version` entry above was confirmed via
+  AWS's public announcement, not the live API).
+
+These two still need a human with AWS credentials to run the `describe-*`
+call against your own account and region before an account-specific bump
+(a live cluster/instance create, not "does this version exist anywhere"),
+on the same cadence as the automated report. Between reports, the public
+announcement pages are good enough to catch the case this doc's own
+history shows actually bites: a config pointing at a minor that has not
+released at all yet. Record the result the way `examples/large/aurora.tf`'s
+comments already do: the exact command (or announcement) checked, not a
+paraphrase.
+
+## Cadence
+
+Review the weekly drift report every time it lands. A patch-safe pin behind
+latest: bump it in the next PR that touches that file anyway, no separate
+ticket needed. A minor- or verification-required pin behind latest: file an
+issue using this doc's tiers to scope the work, the same way issue #124 scoped
+this one.

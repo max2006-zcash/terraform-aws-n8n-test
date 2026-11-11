@@ -1,0 +1,740 @@
+# AGENTS.md
+
+Guidance for AI coding agents (Claude Code, Cursor, Copilot, etc.) working in this
+repository. Human contributors should also find this useful — it explains *what*
+this module is and *what bar* it is held to.
+
+## What this repo is
+
+`terraform-aws-n8n` is a Terraform module that deploys a **production-grade,
+multi-main [n8n Enterprise](https://n8n.io) installation on AWS**. A single
+`terraform apply` brings up the full stack:
+
+- **Amazon EKS** cluster with a managed node group sized for the multi-main
+  workload (default `t3.xlarge`, 3–6 nodes).
+- **Multiple n8n main pods** + dedicated **worker pods** (queue mode) — the
+  Enterprise multi-main topology.
+- **Amazon RDS for PostgreSQL** as the n8n database.
+- **Amazon ElastiCache for Redis** for the Bull queue backing workers.
+- **Amazon S3** for shared binary / file storage, wired in via **EKS Pod
+  Identity** (no static IAM keys in pods).
+- **AWS Load Balancer Controller** + **Cluster Autoscaler** + **KEDA** for
+  ingress, node scaling, and queue-driven worker scaling.
+- **EBS CSI driver** (managed addon, Pod Identity) + a default encrypted
+  **gp3 StorageClass** so PVCs bind out of the box. n8n itself is stateless;
+  this is cluster baseline capability for workloads deployed beside it.
+- **ACM certificate + DNS record** automated end-to-end via Route 53 inside
+  the module (`route53_zone_id`), or via Cloudflare / GoDaddy in the
+  respective examples (which issue the certificate themselves and pass the
+  validated ARN to the module via `certificate_arn`). For any other DNS
+  provider, BYO a pre-validated `certificate_arn`.
+
+The default multi-main topology requires an **n8n Enterprise license key**
+with `feat:multipleMainInstances`. A **Business license** works with
+`n8n_main_hpa_min_replicas = 1`: multi-main is disabled, the main HPA is
+clamped to one, upgrades use `Recreate`, and the only main can be evicted
+with downtime (chart `1.16.0`+ renders no main PodDisruptionBudget; older
+charts render one with `minAvailable: 0`). The module does not provision a
+community-edition deployment. Supply the license through `n8n_license_key`,
+`n8n_license_key_secret_ref`, or, for air-gapped or egress-restricted
+clusters that cannot reach n8n's license server,
+`n8n_license_cert_secret_ref` (a caller-managed Secret holding an offline
+license certificate rendered as `N8N_LICENSE_CERT`). The three are mutually
+exclusive; exactly one must be set. The certificate renders through
+`config.extraEnv`, not the chart's `license.existingSecret` block; that
+block's license helper only ever maps to `N8N_LICENSE_ACTIVATION_KEY`.
+`license.enabled` stays `true` on the certificate path because the chart
+also gates `N8N_MULTI_MAIN_SETUP_ENABLED` on `license.enabled`, not on which
+credential backs it.
+
+The module **expects a pre-existing VPC**. Reference deployments that include
+the VPC are organized as **three sizing tiers** on Route 53:
+[`examples/small/`](./examples/small/) is the smallest viable production
+deployment using module defaults; [`examples/medium/`](./examples/medium/) and
+[`examples/large/`](./examples/large/) are progressively scaled-up reference
+architectures (the canonical reference is whichever matches your scale).
+Two **DNS-variant examples** at `small` sizing,
+[`examples/cloudflare/`](./examples/cloudflare/) and
+[`examples/godaddy/`](./examples/godaddy/), only swap the DNS provider for
+cert validation and the alias record.
+
+Two **topology-variant examples** at `small` sizing.
+[`examples/split-ingress/`](./examples/split-ingress/) sets
+`create_ingress = false` and brings its own pair of Ingresses: an
+internet-facing ALB serving only the webhook path prefixes (optionally behind a
+WAF) and an internal ALB serving the editor UI and REST API.
+[`examples/worker-pools/`](./examples/worker-pools/) declares three
+`n8n_worker_pools` beside the default worker deployment and raises `node_max`
+to hold their autoscaling ceilings and `db_instance_class` to `db.t3.medium`
+for their database connections. **Early Alpha, subject to change without
+notice, and a draft until upstream ships:** the chart side
+(`queueMode.workerGroups`, n8n-io/n8n-hosting#189) is merged to the chart's
+`preview/worker-pools` branch but not released, so the example requires an
+explicit `n8n_chart_version` and documents both an official GHCR preview
+build (published via n8n-io/n8n-hosting#191's `Preview chart` GitHub Action)
+and pushing a private preview build to your own registry; the module rejects
+every numbered `n8n_chart_version` release unless `n8n_worker_pools_chart_verified`
+explicitly attests it, because an older chart accepts the key and silently
+renders nothing (a prerelease build is exempt automatically, taken at the
+caller's word).
+
+Four **customer-managed examples**, also at `small` sizing, cover the
+`create_<x> = false` paths described in
+[`docs/customer-managed-infrastructure.md`](./docs/customer-managed-infrastructure.md).
+[`examples/customer-managed-redis/`](./examples/customer-managed-redis/),
+[`examples/customer-managed-s3/`](./examples/customer-managed-s3/) and
+[`examples/customer-managed-cluster/`](./examples/customer-managed-cluster/)
+each stand up a plain-Terraform stand-in for one piece of infrastructure a
+customer would already run and point the module at it.
+[`examples/customer-managed-everything/`](./examples/customer-managed-everything/)
+combines all three and additionally invokes `modules/controllers` directly,
+which makes it the only root module in the repo that exercises that
+submodule's input contract, so it is the one that catches a change to it.
+
+The DNS, topology and single-layer customer-managed variants are each
+"`small` plus one deliberate difference"; `customer-managed-everything`
+stacks three of those differences, and `medium`/`large` are sizing tiers
+rather than variants. In every case the module inputs `small` passes
+through should stay in sync unless the difference itself removes them.
+That surface drifted silently once (see #136): two examples never received
+a pass-through and three lost their "Production considerations" section.
+`scripts/check-example-parity.sh` (`task example-parity`, local-only for
+now, not yet wired into CI) diffs the set of variable names every example's
+`variables.tf` declares against `small`'s and fails on any name present on
+one side only that is not in its per-example allowlist (the DNS-provider credentials, `customer_managed_*`
+stand-in sizing plus `kubernetes_version` where the example builds its own
+cluster, split-ingress's own Ingress knobs, worker-pools' chart pins and
+default-worker KEDA bounds, large's Aurora and BYO
+certificate inputs, `n8n_additional_domains` where the example cannot
+take it, and the module-side deletion controls (`db_*`,
+`s3_force_destroy`) on a layer the example brings itself, where they would
+be no-ops that only raise the module's `check` warnings). It also fails if
+an example, `small` included, lets the module create RDS or S3 but its
+README has no `## Production considerations` section. It compares names
+only: a shared variable's type, default or description can still differ
+between examples unnoticed, and sizing tiers rely on that. When you add a
+pass-through to `small`, add it to the variants too, or add an allowlist
+entry with a reason. The pass-through itself follows the shape `small`
+uses: a nullable example variable defaulting to `null` so the module's own
+default applies, plus two `run` blocks in the example's
+`tests/defaults.tftest.hcl` reading the module output at the default and
+with the value flipped. `customer-managed-cluster` is the one exception:
+its test file cannot complete an ordinary plan under mocks (its header
+explains why), so there you add a note to that file instead and rely on
+`terraform validate` plus the other examples' runs.
+
+### Architecture at a glance
+
+```text
+   ┌── Route 53 (optional) ──┐
+   │  or Cloudflare (opt.)  │
+   │                        ▼
+   user ──► ALB (AWS LBC) ──► EKS ──► n8n mains ──► RDS (Postgres)
+                                  │           │
+                                  │           └──► ElastiCache (Redis) ◄── workers (KEDA-scaled)
+                                  │
+                                  └──► S3 (Pod Identity) for binary data
+```
+
+### File layout
+
+The module follows the [standard module
+structure](https://developer.hashicorp.com/terraform/language/modules/develop/structure)
+expected by the Terraform Registry:
+
+| File / dir                        | Purpose                                                     |
+| --------------------------------- | ----------------------------------------------------------- |
+| `versions.tf`                     | `required_version` + `required_providers` only.             |
+| `variables.tf`                    | All inputs, with `description`, `type`, and `validation`.   |
+| `outputs.tf`                      | All outputs, with `description` and `sensitive` where needed. |
+| `locals.tf`                       | Shared locals (tags, naming, derived ARNs).                 |
+| `eks.tf` / `database.tf` / `redis.tf` / `s3.tf` / `iam.tf` / `dns.tf` / `n8n.tf` / `controllers.tf` / `keda.tf` / `scaling.tf` / `storage.tf` / `observability.tf` | One file per logical concern. `storage.tf` owns cluster storage (EBS CSI addon + default StorageClass). `observability.tf` owns metrics infrastructure deployed *beside* the release rather than through it (the opt-in `redis_exporter`); n8n's own metrics toggle stays an env var in `n8n.tf`. `dns.tf` owns **all** DNS automation — Route 53, Cloudflare, and GoDaddy paths. Do **not** split by provider. |
+| `README.md`                       | Human entry point; the `<!-- BEGIN_TF_DOCS -->` block is generated by `terraform-docs`. |
+| `LICENSE`                         | Required for registry publication.                          |
+| `examples/small/`                 | Smallest viable production deployment using module defaults (Route 53, includes the VPC). |
+| `examples/medium/`                | Scaled-up reference architecture for ~5–15M exec/day (Route 53, includes the VPC). |
+| `examples/large/`                 | Scaled-up reference architecture for ~50–60M+ exec/day (adds Aurora, PgBouncer, dual-NAT-GW HA, and VPC CNI tuning; Route 53, includes the VPC). |
+| `examples/cloudflare/`            | DNS-variant of `small` using Cloudflare DNS, including the VPC. |
+| `examples/godaddy/`               | DNS-variant of `small` using GoDaddy DNS, including the VPC.    |
+| `examples/split-ingress/`         | Topology-variant of `small`: `create_ingress = false` with a public webhook ALB and an internal admin ALB (Route 53, includes the VPC). |
+| `examples/worker-pools/`          | Topology-variant of `small`: three `n8n_worker_pools` beside the default workers, `node_max` raised to 8 and `db_instance_class` to `db.t3.medium` (Route 53, includes the VPC). **Early Alpha, subject to change without notice.** Requires a chart that renders `queueMode.workerGroups` (merged to the chart's `preview/worker-pools` branch, n8n-io/n8n-hosting#189, not released); `n8n_chart_version` is a required input there. |
+| `examples/customer-managed-redis/` | Customer-managed variant of `small`: a plain-Terraform ElastiCache replication group (AUTH + TLS) stands in for infrastructure the customer already runs, consumed via `create_elasticache = false`. |
+| `examples/customer-managed-s3/`   | Customer-managed variant of `small`: a plain-Terraform bucket with its own security configuration, consumed via `create_s3_bucket = false`. |
+| `examples/customer-managed-cluster/` | Customer-managed variant of `small`: a plain-Terraform EKS cluster and node group, consumed via `create_eks = false` + `existing_eks_cluster_name`. |
+| `examples/customer-managed-everything/` | All of the above at once, plus a **direct `modules/controllers` invocation**: every layer the module can create is customer-managed. The only root module that exercises the controllers submodule's input contract directly. |
+| `tests/*.tftest.hcl`              | `terraform test` plan-time tests with mocked providers.     |
+| `tests/scripts/smoke-test.sh`     | Post-`apply` smoke test for live deployments.               |
+| `tests/scripts/verify-custom-image.sh` | Post-`apply` check for baked-in community nodes (`n8n_image_repository` + `n8n_custom_extensions_path`). |
+| `tests/scripts/verify-worker-pools.sh` | Post-`apply` check that `n8n_worker_pools` actually rendered: counts pool Deployments and ScaledObjects against the declared list, which is the only place a chart that ignored `queueMode.workerGroups` is visible. |
+| `tests/scripts/check-main-chart.sh` | Renders the pinned n8n chart for one, two, and three mains and checks the topology locals against it (CI `chart` job). |
+| `tests/scripts/check-helm-chart-coverage.sh` | Fails when `docs/helm-chart-coverage.md`'s version line or top-level key set is stale against the pinned chart (CI `chart-coverage` job). |
+| `tests/scripts/check-terraform-floor.sh` | Fails unless every `required_version` (root, `modules/*`, `examples/*`) is exactly `">= X.Y"` and `TF_FLOOR_VERSION` is exactly `X.Y.0` (CI `test-floor` job, `task terraform-floor`). |
+| `tests/scripts/check-checkov.sh`  | Runs checkov at exactly `CHECKOV_VERSION`; refuses any other local version (CI `checkov` job). Two passes: defaults, then `tests/checkov/opt-in.tfvars` so count-gated opt-in resources are evaluated too. |
+| `tests/scripts/check-version-drift.sh` | Report-only: every pin reachable from a public API versus upstream latest. Weekly via `version-drift.yml`; never gates. |
+| `tests/scripts/lib/constraints.sh` | Shared `constraint_accepts()`: evaluates a Terraform version constraint (comma-separated `~>`, `>=`, `>`, `<=`, `<`, `!=`, `=`, or a bare version, over numeric `N[.N[.N]]` versions; a prerelease version is an explicit error) against a candidate release. Sourced by `check-version-drift.sh` and `test-version-drift-constraints.sh` (ported from the sibling terraform-google-n8n module, n8n-io/terraform-google-n8n#40). |
+| `tests/scripts/test-version-drift-constraints.sh` | Offline, no-network unit test for `constraints.sh`'s `constraint_accepts()`: a fixed matrix of (constraint, version, expected exit) cases. Runs on every pull request as the `drift-constraints` CI job; `check-version-drift.sh` itself runs weekly through `version-drift.yml`, as a report that never gates. |
+| `tests/scripts/chart-values-diff.sh` | Diffs the pinned n8n chart's `values.yaml` against a candidate version via `helm show values` (`task chart-diff CANDIDATE=<version>`). Informational, never bumps a pin, not in CI. |
+| `tests/scripts/lib/tf-defaults.sh` | Shared `read_default` awk helper that reads a variable's string default out of `variables.tf`. Sourced by `check-version-drift.sh`, `check-helm-chart-coverage.sh` and `chart-values-diff.sh`; the one place that knows the format. |
+| `docs/`                           | Long-form supplementary docs (troubleshooting, post-deploy, cleanup, upgrades, Pod Identity, Helm chart coverage, Istio ingress routing, version currency policy). |
+| `.github/workflows/`              | `terraform-tests.yml`: fmt, validate, test, test-floor, chart, chart-coverage, drift-constraints, tflint, checkov, docs, markdownlint. `version-drift.yml`: weekly report-only pin drift, synced to a tracking issue. |
+| `.github/CODEOWNERS`              | Default reviewers for PRs.                                  |
+| `Taskfile.yml`                    | Optional convenience wrapper (`task ci`) around the local dev loop below; CI does not depend on it. |
+
+## Quality bar: HashiCorp Terraform Registry & Partner Premier Tier
+
+This module targets the quality criteria HashiCorp publishes for partner
+modules in the Terraform Registry — specifically the
+[Partner Premier Tier](https://www.hashicorp.com/en/blog/announcing-the-new-partner-premier-tier-for-the-terraform-registry)
+and the broader [Terraform partnerships
+guidelines](https://developer.hashicorp.com/terraform/docs/partnerships).
+
+> Module quality is ensured through a varied set of standards focused on
+> HashiCorp-defined, best-in-class infrastructure as code principles. This
+> includes:
+>
+> - Successfully passing TFLint, Checkov, or another static code analysis tool
+>   and reporting the result to HashiCorp
+> - Traditional unit and integration testing via Terraform test
+> - Adherence to Terraform's official naming conventions
+> - Clear module documentation
+> - Inclusion of all standard module files
+
+Concretely, in this repo:
+
+### 1. Static analysis (TFLint + Checkov + markdownlint)
+
+`.github/workflows/terraform-tests.yml` runs all three on every PR and push to `main`:
+
+- **`terraform fmt -check -recursive`** — canonical formatting.
+- **`terraform validate`** against the module root *and* every example
+  (`examples/small/`, `examples/medium/`, `examples/large/`,
+  `examples/cloudflare/`, `examples/godaddy/`, `examples/split-ingress/`,
+  `examples/worker-pools/`, `examples/customer-managed-redis/`,
+  `examples/customer-managed-s3/`, `examples/customer-managed-cluster/`,
+  `examples/customer-managed-everything/`) via the CI matrix.
+- **`tflint`** against the module root and every example, with the AWS
+  ruleset initialized via `tflint --init`.
+- **`checkov`** against the Terraform framework, at the version pinned in
+  `CHECKOV_VERSION`. CI runs `tests/scripts/check-checkov.sh`, the same script
+  you run locally, and that script refuses to run against a different checkov
+  version, because results are not comparable across versions. Findings hard-fail the
+  build: every one is either fixed or annotated at its resource with an inline
+  `checkov:skip=<ID>:<reason>`, and `.checkov.yaml` suppresses no check
+  repo-wide. **When you add new resources, do not regress curated findings;
+  prefer fixing them over adding suppressions, and when a suppression is
+  genuinely right, say why at the resource.**
+- **`markdownlint`** against `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, and
+  `docs/*.md` (never `CHANGELOG.md`; see `Taskfile.yml`'s `markdown` task and
+  `.markdownlint.jsonc`), at the version pinned in `MARKDOWNLINT_VERSION`. The
+  generated `<!-- BEGIN_TF_DOCS -->` block in `README.md` is wrapped in
+  `<!-- markdownlint-disable -->` / `<!-- markdownlint-restore -->` comments
+  placed outside the block, because terraform-docs output (placeholder tokens
+  like `<region>`, bare chart-repo URLs) trips false positives that
+  `.markdownlint.jsonc` can't fix without fighting the generator.
+
+**Known gap: checkov never evaluates a resource whose `count` resolves to
+0.** checkov evaluates `count` from variable defaults, and from every root
+module it finds (the examples call this module with `source = "../.."`),
+then answers every check on a count-0 resource with `UNKNOWN` and omits it
+from the report. An opt-in resource whose toggle is `false` in the module
+defaults and in every example is therefore never checked, and **a green
+default scan asserts nothing about it.** Measured on checkov 3.3.17, the CI
+pin at the time: `kubernetes_deployment_v1.redis_exporter` draws 0 results with
+defaults and 27 checks with `redis_exporter_enabled = true` (the same 27 that
+`examples/large/pgbouncer.tf`'s always-on `kubernetes_deployment` draws). The
+`_v1`/`_v2` resource names are *not* the cause, despite what
+[#120](https://github.com/n8n-io/terraform-aws-n8n/issues/120) first assumed:
+checkov registers `kubernetes_deployment_v1`, `kubernetes_service_v1` and the
+other versioned names alongside the unsuffixed ones.
+
+`tests/scripts/check-checkov.sh` therefore runs **two passes**: the
+configuration as written, then the same scan with `--var-file
+tests/checkov/opt-in.tfvars`, which turns every opt-in toggle on. The second
+pass also fails if it did not reach each address in the script's
+`OPT_IN_RESOURCES`, so a rename or a toggle that stops resolving cannot
+shrink coverage back to zero unnoticed. **When you add an opt-in
+`kubernetes_*` resource, add its toggle to the tfvars and its address to
+that list**, then curate what the pass reports exactly as for always-on
+code: fixed, or annotated at the resource.
+
+**Exported `TF_VAR_*` silently disable pass 2.** On checkov 3.3.20, a single
+exported `TF_VAR_*` (even one the module has no input for, such as
+`TF_VAR_location`) makes checkov ignore `--var-file`: pass 2 reports the same
+counts as pass 1 and `check-checkov.sh` exits 1 with "pass 2 did not reach
+`kubernetes_deployment_v1.redis_exporter[0]`". That message looks like a
+missing toggle or a renamed resource, but it is the environment. The script
+unsets every `TF_VAR_*` itself, so it is safe to run from a shell that
+exports them (CI does not). If you invoke checkov directly, unset them first
+or pass 2 proves nothing. A real pass 2 reports more passed checks than pass 1.
+
+The scan is still not the whole story. checkov has no Terraform check at all
+for several fields the exporter hardens (`run_as_non_root`, the pinned UID,
+the probe target), so any hand-written pod spec MUST also get its own
+`terraform test` assertions for the security context, resource limits, image
+pin, and probes, the way `tests/defaults.tftest.hcl`'s
+`redis_exporter_pod_spec_is_hardened_by_hand` does.
+
+### 2. Unit + integration tests via `terraform test`
+
+- `tests/defaults.tftest.hcl` is the canonical plan-time test suite. It uses
+  `mock_provider` for `aws`, `kubernetes`, `helm`, `random`, and `time`, and
+  `override_data` for `aws_caller_identity` / IAM policy documents. This means
+  the suite runs **without AWS credentials** and is safe to run in CI.
+- `tests/additional-domains.tftest.hcl` is separate for one reason:
+  `mock_provider` is file-scoped, and a mocked value can only hold one shape per
+  file. Its mocked `domain_validation_options` describes a three-name
+  certificate, while `defaults.tftest.hcl` describes a single-name one. Put a
+  run in its own file when it needs a different mocked shape rather than
+  widening the shared mock, which silently weakens every other run that reads
+  the same attribute.
+- Each example has its own `tests/defaults.tftest.hcl` (`small`, `medium`,
+  `large`, `cloudflare`, `godaddy`, `split-ingress`, `worker-pools`) that exercises the example end-to-end with
+  the same mocking strategy, catching wiring mistakes between the module and a
+  realistic caller.
+- CI runs these suites twice: the `test` job on `TF_VERSION` and the
+  `test-floor` job on `TF_FLOOR_VERSION`, the lowest release the declared
+  `required_version` admits (see "The floor is `>= 1.13`" below).
+  `tests/scripts/check-terraform-floor.sh` runs in `test-floor` and fails if
+  any of the thirteen declarations disagrees with `TF_FLOOR_VERSION`.
+- `tests/scripts/check-main-chart.sh` renders the pinned n8n chart with the
+  topology locals for one, two, and three mains. It checks the main rollout
+  strategy, HPA bounds, and disruption budget, and verifies that worker and
+  webhook strategies stay unchanged. Run with `task chart` (requires Helm and
+  jq); CI runs the same script. It does not run Kubernetes controllers or
+  prove the full Helm resource wiring, which still needs a real plan and
+  staging rollout/drain test.
+- `tests/scripts/check-helm-chart-coverage.sh` pulls the pinned n8n chart's
+  `values.yaml` and fails if `docs/helm-chart-coverage.md`'s "Verified against
+  chart version" line disagrees with `n8n_chart_version`'s default, or if the
+  chart has a top-level key the doc's coverage table never mentions. Run with
+  `task chart-coverage` (requires Helm); CI runs the same script. It checks
+  that the doc is not stale, not that a row's content is still accurate.
+- `tests/scripts/check-version-drift.sh` is report-only and never gates:
+  `.github/workflows/version-drift.yml` runs it weekly and syncs the output
+  to one tracking issue. See `docs/versioning.md` for the bump tiers and for
+  the pins it cannot see without AWS credentials.
+- `tests/scripts/smoke-test.sh` is the **integration / post-apply** check used
+  against a real cluster — kept out of CI on purpose (it needs live AWS
+  credentials and an applied stack).
+- `tests/scripts/verify-custom-image.sh` is the same tier, narrowed to
+  deployments that bake community packages into a custom image. Plan-time tests
+  cannot reach what it checks: whether n8n *loaded* the baked nodes, and whether
+  it loaded them on workers as well as mains. A deployment can pass every other
+  check and still fail only when a production execution hits the node.
+- `tests/scripts/verify-worker-pools.sh` is the same tier again, for
+  deployments that declare `n8n_worker_pools`. It counts the rendered pool
+  Deployments and ScaledObjects against the declared list and checks their
+  labels, env, triggers and READY state. Plan-time tests structurally cannot
+  do this: the mocked helm provider accepts any values, and a real chart that
+  predates `queueMode.workerGroups` also accepts them and renders nothing, so
+  the release applies clean with the feature flag on and no pool behind it.
+  At plan, the chart pairing is a precondition on `helm_release.n8n` in
+  `n8n.tf` (its locals live in `worker-pools.tf`) and the image pairing is a
+  `check` block in `worker-pools.tf`; this script is what catches the outcome.
+
+When you add a feature, add an `assert` for it in the relevant `.tftest.hcl`
+file. Use `command = plan` unless you specifically need apply semantics.
+
+#### Known mock provider limitations
+
+- **`helm_release.values` is unknown at plan time.** The `values` argument is
+  a locally-computed `yamlencode()` block, but because it belongs to a
+  resource that depends on `kubernetes_namespace` (whose attributes are
+  `(known after apply)` under the mock provider), the whole resource —
+  including its inputs — is deferred. You cannot assert on Helm values
+  content in `command = plan` tests.
+- **`command = apply` under mocks fails ARN validation.** The AWS mock
+  provider generates random strings for computed attributes. Resources that
+  consume an ARN as an input (`aws_iam_role_policy_attachment.policy_arn`,
+  `aws_eks_cluster.role_arn`, `aws_db_instance.kms_key_id`, etc.) will
+  reject the mock-generated values with "invalid ARN" errors at apply time.
+  Wiring these up with `override_resource` blocks for every IAM resource is
+  disproportionate boilerplate.
+- **Mocks do not enforce dependency ordering or server-side preconditions.**
+  The mock `kubernetes` provider will happily "create" a namespaced resource
+  whose namespace does not exist, so a missing dependency edge passes every
+  plan-time assert and then fails on a real apply with
+  `namespaces "n8n" not found`. This is not hypothetical: `output "namespace"`
+  once returned `var.namespace`, a plan-time constant, which left callers'
+  `kubernetes_*` resources with no edge to `kubernetes_namespace.n8n`. The full
+  suite was green and the first live apply failed. Whenever an output is
+  intended to order a caller's resources, return the **resource attribute**
+  rather than the variable, and treat "did the graph actually serialise these"
+  as a question only a live apply answers.
+- **A `run` block cannot express "argument passed as `null`".** In a `variables`
+  block, `x = null` means *unset*: the variable takes its default and no error is
+  raised. A real caller writing `x = null` in a `module` block is different:
+  null **propagates into the module** rather than falling back to the default,
+  unless the variable declares `nullable = false`. Measured on 1.9.8 (before the
+  floor moved; the behaviour is unchanged since), one module
+  with `default = 6` invoked three ways: no argument sees `6`; `n = null` on a
+  nullable variable sees `null`; `n = null` on a `nullable = false` variable sees
+  `6`, silently, with no error. Only the middle case can break anything, and it
+  is the only one a `run` block cannot reproduce.
+
+  This is not academic. It is how the `nullable = false` gap on the autoscaling
+  inputs was found (see `scaling.tf`): Terraform evaluates a `check` block's
+  `error_message` alongside its condition rather than lazily on failure, so a
+  propagated null reached the message's interpolations and aborted the plan with
+  `Invalid template interpolation value`, from a block whose entire purpose is
+  to warn *without* failing. `expect_failures` cannot assert it; the attempt
+  fails with "Missing expected failure".
+
+  So: for any input with a default where null is not meaningful, declare
+  `nullable = false` rather than trusting a test to catch it. Null-handling is a
+  question only a real `module` block answers, which means a live plan against a
+  caller configuration rather than the mocked suite.
+
+#### Write guard-style `check` conditions as `guard ? body : true`
+
+```hcl
+# Preferred.
+condition = var.create_database ? (var.db_host == null && var.db_password == null) : true
+
+# Avoid.
+condition = !var.create_database || (var.db_host == null && var.db_password == null)
+```
+
+Both forms behave identically on the versions this module now supports, so
+this is a consistency rule rather than a correctness one, and the existing
+`check` blocks all use the first form. Keep matching them: nest rather than
+chaining `||` inside the body. The same shape is used for null guards in
+`validation` blocks (`var.x == null ? true : (...)`).
+
+It used to be a correctness rule, and the history is worth knowing before
+anyone "simplifies" one of these back. Short-circuit evaluation of `&&` and
+`||` arrived in Terraform **1.12**
+([hashicorp/terraform#36224](https://github.com/hashicorp/terraform/issues/36224),
+listed in the v1.12.0 changelog), not 1.10 as this file once claimed. Before
+1.12 both operands were evaluated, which broke the `||` form in two ways:
+
+- `known_true || unknown` was *unknown*, and a `check` whose condition is
+  unknown at plan fails `terraform test` with "Check block assertion known
+  after apply". The `!guard || body` shape broke whenever the right side read
+  an input a caller wired from a resource attribute, `examples/large` being
+  the canary because it wires `db_password` from
+  `random_password.aurora.result`. This bit while `required_version` was
+  `>= 1.9` and CI pinned 1.9.8.
+- `var.x == null || <expression on var.x>` still evaluated the right side
+  when `var.x` was null, so arithmetic or a function call on it aborted the
+  plan instead of passing or failing the validation. This bit on the
+  `>= 1.11` floor: #167 (`db_max_allocated_storage`, fixed before merge) and
+  #175 (the `n8n_dns_config` `ndots` validation). CI ran only a newer
+  Terraform, so neither failed there; #175 shipped and hit callers on 1.11.
+
+The floor is now `>= 1.13` and CI tests it (see below), so the hazard is
+retired. It is written down because "this reads more naturally as
+`!guard || body`" is a reasonable instinct that was, for a long stretch of
+this repo's history, wrong, and that an untested floor hid twice.
+
+#### The floor is `>= 1.13`
+
+Declared as `required_version = ">= 1.13"` everywhere: root, `modules/controllers`,
+and all eleven examples, though not all in a `versions.tf` — nine examples have
+one, but `cloudflare` and `godaddy` declare it inline in `providers.tf`
+instead. CI's `test-floor` job runs every `terraform test` suite on
+`TF_FLOOR_VERSION` (`1.13.0`, the lowest release the floor admits), next to
+the `test` job on `TF_VERSION`, and `tests/scripts/check-terraform-floor.sh`
+(`task terraform-floor`) fails it if the declarations and `TF_FLOOR_VERSION`
+disagree.
+
+It moved to `>= 1.13` from `>= 1.11` in one step, for two reasons:
+
+- **1.12** added short-circuit evaluation of `&&` and `||` (see above),
+  after #167 and #175 broke on 1.11 while CI ran only 1.16.
+- **1.13** fixed `terraform test` leaving about one provider plugin process
+  (~70 MB) running per run block, on 1.12.x and older (also seen on 1.9.8
+  and 1.11.4). Measured locally, 1.12.0 reached 199
+  provider processes and 14 GB after ~185 runs (1.12.2 leaks the same
+  way), so the 806-run `tests/defaults.tftest.hcl` was killed with exit code
+  143 at ~430 runs on a 16 GB CI runner. 1.13.0 stays at 5 processes. On
+  1.12 the floor could not run this repo's own suite, which is what makes a
+  floor a checked claim. The leak is specific to `terraform test`, not to
+  the module code, but the floor now makes `init` reject 1.12 as well.
+
+It had moved to `>= 1.11` from `>= 1.9` because `override_resource`'s
+`override_during` attribute, which
+`examples/customer-managed-redis` and `-s3` need to assert a plan-time value
+on a resource the same configuration creates, arrived in 1.11
+(hashicorp/terraform#36227) and is silently ignored before it. A silently
+ignored override does not error; it turns the documented `terraform test`
+command into a confusing assertion failure, which is the worst way to learn
+about a version constraint. `-cluster` tried the same technique for an
+unrelated problem and it didn't work there; its floor is inherited from the
+module's, not from `override_during` (see its own `versions.tf`).
+
+Keep all thirteen declarations and `TF_FLOOR_VERSION` in step when bumping.
+A floor the CI does not exercise is a claim nobody is checking.
+
+**Recommended pattern** when end-to-end wiring cannot be tested under mocks:
+
+1. Write `command = plan` assertions at the variable contract level (default
+   value, type acceptance, validator rejection).
+2. Add a comment in the test file explaining *why* the wiring cannot be
+   asserted and *how* to verify it manually (e.g. "run a real `terraform
+   plan` from the Terraform Cloud workspace").
+3. Do not reach for `command = apply` to work around plan-time unknowns —
+   the ARN validation failures produce worse noise than the coverage gap.
+
+### 3. Naming conventions
+
+This module follows the [Terraform module
+conventions](https://developer.hashicorp.com/terraform/language/modules/develop/structure):
+
+- Repository name is **`terraform-<PROVIDER>-<NAME>`** → `terraform-aws-n8n`.
+- Resource names use **`snake_case`**. The "main" resource of a kind in this
+  module is named `n8n` (e.g. `aws_eks_cluster.n8n`, `aws_db_instance.n8n`,
+  `aws_elasticache_cluster.n8n`) — this matches the registry convention of
+  using a short, descriptive label rather than repeating the resource type.
+- Variables and outputs use **`snake_case`** with a leading noun
+  (`cluster_name`, `n8n_domain`, `route53_zone_id`, `alb_hostname`).
+- Every variable has a `description` and a `type`. Most have a `validation`
+  block that fails fast with a useful error message — preserve this when
+  adding new inputs.
+- Every output has a `description`. Outputs containing secrets are marked
+  `sensitive = true`.
+- All taggable AWS resources receive `local.common_tags`, which always
+  includes `ManagedBy = "terraform"` and `Project = "n8n"` and merges
+  `var.tags` on top.
+
+### 4. Clear documentation
+
+- `README.md` is the entry point. The `## Reference` section between
+  `<!-- BEGIN_TF_DOCS -->` and `<!-- END_TF_DOCS -->` is **auto-generated**
+  — do not hand-edit it. All rendering options (formatter, output template,
+  `lockfile: false` to keep providers shown as constraints) live in
+  `.terraform-docs.yml`, so refreshing the README is one command:
+
+  ```bash
+  brew install terraform-docs   # or: see the install step in .github/workflows/terraform-tests.yml
+  terraform-docs .
+  ```
+
+  CI installs the same version (`v0.24.0`, tracking the brew default) and
+  runs `terraform-docs --output-check .` — see the `docs` job in
+  `.github/workflows/terraform-tests.yml`. If your local version differs
+  from CI's, the markdown table whitespace will drift and the check will
+  fail; bump both together when upgrading.
+
+- Each example has its own `README.md` documenting the runnable example.
+- `docs/troubleshooting.md`, `docs/post-deployment.md`,
+  `docs/destroy-cleanup.md`, `docs/upgrading-n8n.md`, `docs/pod-identity.md`,
+  `docs/helm-chart-coverage.md`, `docs/istio-ingress.md`, `docs/tls-proxy.md`,
+  `docs/shared-responsibility.md`, `docs/build-time-decisions.md`, and
+  `docs/sandbox.md` cover operator-facing concerns that don't belong inline
+  in `README.md`. `docs/versioning.md` is the contributor-facing
+  inventory of every pinned version and the bump tier each falls into; read
+  it before bumping any provider, chart, engine, or CI tool version.
+- Inline comments in `.tf` files use the `# ── Section ──` banner style. Every
+  `variable`/`output` block lives under one of these banners.
+  `scripts/check-variable-banners.sh` (`task banners`, local-only for now —
+  not yet wired into CI) fails if a block has no banner above it, or if a
+  banner comment doesn't match the `# ── Name ──...──` format.
+
+  **`variables.tf` banners, in file order:**
+
+  | Banner | Covers |
+  |---|---|
+  | `Common` | Naming/tagging threaded through every resource (`cluster_name`, `tags`, `namespace`) |
+  | `Foundation inputs` | Region, VPC, DNS/cert, k8s version, license — inputs the caller supplies from their own infra |
+  | `EKS cluster` | Control-plane properties the module owns: API server endpoint access and Secrets encryption |
+  | `Ingress` | ALB / ingress-controller settings |
+  | `Nodes` | EKS managed node group sizing |
+  | `Cluster controllers` | The `install_*` toggles for LBC, Cluster Autoscaler, metrics-server and KEDA, plus `lbc_pdb_enabled` |
+  | `Chart repositories` | The `*_chart_repository` overrides, one per chart the module installs |
+  | `Chart versions` | The `*_chart_version` pins, plus n8n image tag/repository/pull secrets, Helm timeout, timezone and logging |
+  | `n8n resource requests and limits` | CPU/memory requests and limits, one set per pod role |
+  | `Execution settings` | Worker concurrency, execution timeouts, pruning, execution-data storage mode |
+  | `Graceful shutdown` | Termination grace period, prestop sleep, and the webhook processor and worker PodDisruptionBudget toggles |
+  | `Task runners` | Task runner sizing and lifecycle |
+  | `RDS PostgreSQL` | Everything database-related, including `create_database` and the customer-managed `db_*` references |
+  | `ElastiCache Redis` | Redis sizing, HA/TLS/KMS topology, and the customer-managed `redis_*` references |
+  | `S3` | Bucket creation, the customer-managed `existing_s3_bucket_name` reference, and bucket encryption |
+  | `HPA: main pods` / `HPA: webhook processor pods` | CPU-based autoscaling |
+  | `Observability` | Metrics/telemetry toggles |
+  | `Community packages` | Custom-node loading, OTEL export, log streaming, the `n8n_extra_env` escape hatch |
+  | `Credential overwrites` | Caller-managed Kubernetes Secret reference for file-based credential overwrites |
+  | `External Secrets` | External Secrets Operator integration |
+  | `KEDA: worker pods` | Queue-depth autoscaling |
+  | `Pod DNS` | Pod-level DNS settings (`n8n_dns_config`) to work around Kubernetes' `ndots:5` search-path amplification |
+  | `Worker pools` | `n8n_worker_extra_env` and `n8n_worker_pools`: worker-only env and the labelled pools mapped onto the chart's `queueMode.workerGroups` |
+
+  `scripts/check-variable-banners.sh` hardcodes this same list, in this same
+  order, and fails if `variables.tf` disagrees with it. Update the table and
+  the script together, or the check goes red on an untouched checkout.
+
+  `outputs.tf` banners: `App DNS`, `Secrets`, `Infrastructure`.
+
+  When adding a variable, file it under the banner matching what it
+  *configures* — not which feature or PR introduced it. A new OTEL sampling
+  knob belongs in `Community packages`, next to the other OTEL vars, not a new
+  one-off banner. Only add a new banner when a variable's theme doesn't fit
+  any existing section, the way `Common` didn't fit `Foundation inputs` (see
+  #81). Match the banner's dash-padding to its neighbors — copy an existing
+  banner line and rename it rather than typing dashes by hand.
+
+### 5. Standard module files
+
+All of the following are present and should stay present:
+
+- `README.md`, `LICENSE`, `versions.tf`, `variables.tf`, `outputs.tf`
+- `examples/` with at least one runnable example
+- `tests/` with at least one `.tftest.hcl` suite
+- `.github/workflows/` with the CI pipeline above
+
+## How to work in this repo (agent quick reference)
+
+### Vendored agent skills
+
+`.agents/skills/` contains two skills vendored from
+[hashicorp/agent-skills](https://github.com/hashicorp/agent-skills) via the
+[skills CLI](https://skills.sh) and pinned by `skills-lock.json`:
+`terraform-style-guide` and `terraform-test`. Agents that read
+`.agents/skills/` (pi does natively; Claude Code via the git-ignored
+`.claude/skills/` symlinks) load them automatically. The symlinks are not
+committed; Claude Code users create them once per clone:
+
+```bash
+mkdir -p .claude/skills
+ln -sf ../../.agents/skills/terraform-style-guide \
+       ../../.agents/skills/terraform-test .claude/skills/
+```
+
+Do not hand-edit the vendored files; update them with `skills update -p`.
+Where a skill's generic guidance
+conflicts with this repo's conventions (e.g. the style guide's `terraform.tf`
+vs this repo's `versions.tf`, or its Terraform version floor), **this
+`AGENTS.md` and the existing repo layout win**.
+
+### Local development loop
+
+`task ci` (see [`Taskfile.yml`](./Taskfile.yml), requires
+[`task`](https://taskfile.dev)) runs the full loop below across the module
+root and every example in one command. The raw commands work identically
+without `task` installed:
+
+```bash
+# The veksh/godaddy-dns provider requires credentials even in plan-time tests.
+# Export stubs once per shell session before running terraform test.
+export GODADDY_API_KEY=stub GODADDY_API_SECRET=stub
+
+terraform fmt -recursive                       # before committing
+terraform init -backend=false                  # at module root
+terraform validate
+terraform test -verbose                        # plan-time, no AWS creds needed
+tests/scripts/check-main-chart.sh              # chart rendering, Helm + jq needed
+tests/scripts/check-helm-chart-coverage.sh     # helm-chart-coverage.md drift, Helm needed
+tests/scripts/check-terraform-floor.sh         # required_version == TF_FLOOR_VERSION
+tests/scripts/test-version-drift-constraints.sh # constraint evaluator, python3 needed
+tflint --init && tflint --format compact
+terraform-docs --output-check .                # README drift check
+markdownlint README.md CONTRIBUTING.md AGENTS.md docs/*.md
+
+# Repeat under each example. This list mirrors the CI matrix (the `target:`
+# lists in .github/workflows/terraform-tests.yml) and Taskfile.yml's EXAMPLES
+# var, so a green local run means CI will be green too, on the Terraform you
+# ran it with. CI also repeats `terraform test` on TF_FLOOR_VERSION (the
+# test-floor job); run the tests with that binary too when a change could
+# depend on the Terraform version. Keep all three lists in sync when adding an
+# example: one that no local wrapper visits is one nobody validates before
+# pushing.
+for ex in small medium large cloudflare godaddy split-ingress worker-pools \
+          customer-managed-redis customer-managed-s3 \
+          customer-managed-cluster customer-managed-everything; do
+  ( cd "examples/$ex" \
+      && terraform init -backend=false \
+      && terraform validate \
+      && terraform test -verbose \
+      && tflint --init && tflint --format compact \
+      && terraform-docs --output-check . ) || echo "FAILED: $ex"
+done
+```
+
+A real deployment uses `terraform apply` from `examples/small/` with a
+populated `terraform.tfvars` — but **never apply from CI** in this repo.
+
+### Provider lock files
+
+`.terraform.lock.hcl` is committed at the module root and in every
+`examples/*` root module, each locked for `linux_amd64`, `linux_arm64`, and
+`darwin_arm64` (Intel macOS is intentionally out of scope). This is what lets
+`actions/cache` in `.github/workflows/terraform-tests.yml` key the provider
+plugin cache and lets repeated local `terraform init` runs skip the registry
+download.
+
+Refresh a lock file after changing a `required_providers` constraint by
+re-running the same `providers lock` invocation in that root module:
+
+```bash
+terraform providers lock -platform=linux_amd64 -platform=linux_arm64 -platform=darwin_arm64
+```
+
+On an unlocked platform (Intel macOS, Windows), `terraform init` fails with
+"no compatible checksums"; re-run the command above with your platform added
+(e.g. `-platform=darwin_amd64`) locally, without committing the result.
+
+The module root's lock file exists only to cache the dev loop and CI; it is
+never read by consumers of the published module (Terraform resolves a
+root module's own lock file, not one committed inside a dependency). That is
+why `.terraform-docs.yml` keeps `lockfile: false`: the README reference
+table must keep showing the provider *constraints* from `versions.tf`, not
+the pinned versions this lock file resolves to.
+
+### When adding a new input
+
+1. Add it to `variables.tf` with `description`, `type`, sensible `default`
+   (if any), and a `validation` block when it adds meaningful guardrails.
+   Prefer adding validation for new inputs, but align with existing patterns in
+   `variables.tf` and avoid redundant checks.
+2. Surface it on the resource(s) that consume it.
+3. Add an `assert` in `tests/defaults.tftest.hcl` (and the relevant example
+   test file if the variable is exercised by an example). See *Known mock
+   provider limitations* below for guidance when end-to-end wiring cannot be
+   tested under mocks.
+4. Update `CHANGELOG.md` — add a bullet under `## [Unreleased] / ### Added`.
+5. Re-run `terraform-docs .` to refresh the `README.md` reference table.
+   **This step is CI-gated** — the `docs` job runs `terraform-docs
+   --output-check .` and will fail the PR if the README is stale.
+6. Run the full local loop (`terraform fmt -recursive`, `terraform validate`,
+   `terraform test`) and confirm all tests pass **before committing**.
+
+### When adding a new resource
+
+1. Put it in the existing `.tf` file matching its concern (e.g. anything DB →
+   `database.tf`). Create a new file only for a genuinely new concern.
+2. Tag it with `tags = local.common_tags` (or merge into it) if the resource
+   supports tags.
+3. Reference it from the relevant output, if it's user-facing.
+4. Add a plan-time assertion if the resource encodes a non-obvious default.
+5. Run `tflint` and `checkov` locally before pushing — CI will run them
+   anyway, but failing fast saves a round trip.
+
+### What *not* to do
+
+- Don't configure providers inside the module. `versions.tf` declares
+  `required_providers`; provider configuration is the caller's job (see
+  `examples/small/providers.tf`).
+- Don't introduce nested `module` calls without a strong reason — this module
+  is intentionally flat so registry consumers can read it top to bottom.
+- Don't commit `terraform.tfstate*`, `*.tfplan`, `apply*.log`, or
+  `terraform.tfvars`. The `.gitignore` already covers these; check before
+  committing if you ran `apply` locally inside `examples/small/`.
+- Don't hand-edit the `<!-- BEGIN_TF_DOCS -->` block in `README.md`.
+- Don't widen `soft_fail` or silence lint rules without a comment explaining
+  why and a follow-up TODO.
+- Don't add inline lint-suppression comments (`<!-- markdownlint-disable -->`,
+  `# tflint-ignore`, `# checkov:skip`) as a first response to a lint
+  warning. Prefer fixing the root cause or updating the relevant config file
+  (`.markdownlint.jsonc`, `.tflint.hcl`). Inline suppressions are acceptable
+  only for genuine false positives that cannot be resolved at the config
+  level, and must include a comment explaining why.
+
+## References
+
+- [Terraform module structure](https://developer.hashicorp.com/terraform/language/modules/develop/structure)
+- [Publishing modules to the Terraform Registry](https://developer.hashicorp.com/terraform/registry/modules/publish)
+- [Terraform partnerships guidelines](https://developer.hashicorp.com/terraform/docs/partnerships)
+- [Announcing the new Partner Premier Tier for the Terraform Registry](https://www.hashicorp.com/en/blog/announcing-the-new-partner-premier-tier-for-the-terraform-registry)
+- [`terraform test` framework](https://developer.hashicorp.com/terraform/language/tests)
+- [`terraform-docs`](https://terraform-docs.io/)
+- [TFLint](https://github.com/terraform-linters/tflint) · [Checkov](https://www.checkov.io/)

@@ -1,0 +1,145 @@
+# Customer-managed Redis example
+
+Points `terraform-aws-n8n` at a Redis it does not own, instead of letting it create one, and exercises AUTH and TLS on that path along the way.
+
+Use this when your organization already runs Redis/ElastiCache for other workloads and wants n8n to share that operational surface, rather than standing up a second Redis this module manages independently.
+
+## What it creates
+
+This example is two things layered together:
+
+1. **A stand-in for infrastructure a customer already has.** `main.tf`'s "Customer-managed Redis (stand-in)" section provisions an `aws_elasticache_replication_group` (two nodes, automatic failover, transit encryption required, an AUTH token) and an `aws_elasticache_parameter_group` (family `redis7`, `maxmemory-policy = noeviction`) with plain Terraform resources, entirely independent of the `terraform-aws-n8n` module. In a real deployment this section would not exist: your Redis would already be running, owned by whatever created it. The AUTH token is a plain variable (`customer_managed_redis_auth_token`), not a generated `random_password`, deliberately: the module gates a resource count on whether `redis_auth_token` is set, and a count can never depend on a value unknown until apply, which a fresh `random_password.result` always is on its first create. A real customer-managed Redis's token is already a known secret anyway, not something Terraform would generate in the same apply.
+2. **Everything the `terraform-aws-n8n` module creates, except its Redis tier** (`create_elasticache = false`): VPC, EKS cluster, node group, RDS PostgreSQL, S3 bucket, AWS Load Balancer Controller, Cluster Autoscaler, metrics-server, KEDA, and the n8n Helm release. The module is wired at the stand-in replication group's endpoint and AUTH token exactly as it would be at a real customer-managed Redis.
+
+## Why AUTH and TLS specifically
+
+The root README's "Bring your own Redis" section used to say the customer-managed Redis path supported host and port only, no password, no TLS. That was stale: `redis_auth_token` (or `redis_auth_token_secret_ref`) and `redis_transit_encryption_enabled` both work on the `create_elasticache = false` path today, matching whatever your existing Redis actually requires. This example deliberately exercises both, rather than the simpler unauthenticated/plaintext case, so the toggle combination that used to be undocumented has a real, tested reference plan.
+
+## Adapting to your real infrastructure
+
+To point this at a Redis you actually run instead of the stand-in:
+
+1. Delete the entire "Customer-managed Redis (stand-in)" section from `main.tf` (the security group, subnet group, parameter group, and `aws_elasticache_replication_group` resources), and the `customer_managed_redis_auth_token` / `customer_managed_redis_node_type` variables it used.
+2. In `module "n8n"`, replace the values wired to those deleted resources with your own Redis's coordinates:
+   ```hcl
+   create_elasticache               = false
+   redis_host                       = "your-redis.abc123.use1.cache.amazonaws.com" # primary endpoint, not a node address
+   redis_port                       = 6379
+   redis_auth_token                 = var.your_redis_auth_token # omit entirely if unauthenticated
+   redis_transit_encryption_enabled = true # omit (defaults false) if your Redis is plaintext
+   ```
+3. Make sure your Redis is reachable from the EKS node subnets on `redis_port`. This module creates no security group on this path; the rules that let the nodes in are yours to write, same as the stand-in's own security group does here.
+4. If your Redis is a replication group, use its **primary endpoint**, not a node address, so the name follows the primary across a failover.
+5. Check your Redis's `maxmemory-policy`. Deleting the stand-in also deletes its `noeviction` parameter group, and the module sets no eviction policy on a Redis it does not manage. An ElastiCache Redis on the `default.redis7` group runs `volatile-lru`, which can silently evict Bull keys that carry a TTL, such as job locks, under memory pressure. Use `noeviction` (or at least avoid the `allkeys-*` policies, which can also evict job data). See the root [README.md → "Redis eviction policy"](../../README.md#redis-eviction-policy) for the trade-offs.
+
+See the root [README.md → "Customer-managed Redis"](../../README.md#customer-managed-redis) for the full details on this toggle.
+
+## Prerequisites
+
+- A Route53 hosted zone for the parent domain (e.g. `example.com` if `n8n_domain = n8n.example.com`). Note its zone ID.
+
+## Apply
+
+```bash
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars and set n8n_domain, route53_zone_id, n8n_license_key
+
+terraform init
+terraform apply -compact-warnings
+```
+
+After apply, see the root [`docs/post-deployment.md`](../../docs/post-deployment.md) for DNS propagation and license activation.
+
+## Production considerations
+
+This example is a reference deployment optimized for clean `apply` / `destroy` cycles during evaluation. Only Redis is customer-managed here; the module still creates RDS and S3 with the same teardown-friendly defaults documented in [`examples/small`](../small/README.md#production-considerations), and you should review those before promoting this example to production:
+
+| Module input | Current default | Production |
+|---|---|---|
+| `db_backup_retention_period` | `7` | Match your RPO (up to 35 days) |
+| `db_deletion_protection` | `false` | `true` |
+| `db_skip_final_snapshot` | `true` | `false`, plus set `db_final_snapshot_identifier` |
+| `db_delete_automated_backups` | `true` | `false` |
+| `s3_force_destroy` | `true` | `false` |
+
+These inputs are passed straight through to the module; set them in `terraform.tfvars` (or via any other variable source) to override the defaults. They no longer require wrapping or forking the module.
+
+See [`docs/build-time-decisions.md`](../../docs/build-time-decisions.md) for the module-level settings elsewhere in the root module that are fixed at the first `terraform apply`.
+
+<!-- BEGIN_TF_DOCS -->
+## Requirements
+
+| Name | Version |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.13 |
+| <a name="requirement_aws"></a> [aws](#requirement\_aws) | ~> 6.0 |
+| <a name="requirement_helm"></a> [helm](#requirement\_helm) | ~> 3.0 |
+| <a name="requirement_kubernetes"></a> [kubernetes](#requirement\_kubernetes) | ~> 3.0 |
+
+## Providers
+
+| Name | Version |
+| ---- | ------- |
+| <a name="provider_aws"></a> [aws](#provider\_aws) | ~> 6.0 |
+
+## Modules
+
+| Name | Source | Version |
+| ---- | ------ | ------- |
+| <a name="module_n8n"></a> [n8n](#module\_n8n) | ../.. | n/a |
+| <a name="module_vpc"></a> [vpc](#module\_vpc) | terraform-aws-modules/vpc/aws | ~> 5.0 |
+
+## Resources
+
+| Name | Type |
+| ---- | ---- |
+| [aws_elasticache_parameter_group.customer_managed](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/elasticache_parameter_group) | resource |
+| [aws_elasticache_replication_group.customer_managed](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/elasticache_replication_group) | resource |
+| [aws_elasticache_subnet_group.customer_managed](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/elasticache_subnet_group) | resource |
+| [aws_security_group.customer_managed_redis](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
+| [aws_availability_zones.available](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/availability_zones) | data source |
+
+## Inputs
+
+| Name | Description | Type | Default | Required |
+| ---- | ----------- | ---- | ------- | :------: |
+| <a name="input_aws_partner_attribution_tag"></a> [aws\_partner\_attribution\_tag](#input\_aws\_partner\_attribution\_tag) | Value of the aws-apn-id tag added to every taggable AWS resource this example and the module create, so AWS Partner Revenue Measurement attributes their spend to n8n. Passed to the module's aws\_partner\_attribution\_tag and merged into this example's own tags, which is how the VPC, NAT gateway and any stand-in infrastructure get it. This input owns the tag: an aws-apn-id key in tags is ignored. Set to an empty string to remove the tag from resources Terraform manages and stop new load balancers and volumes receiving it; EBS volumes that already exist keep it. Keep the default and validation in sync with the module root's variables.tf. | `string` | `"pc:26au7o6cdeh7fqdt376h9m9xk"` | no |
+| <a name="input_aws_region"></a> [aws\_region](#input\_aws\_region) | AWS region to deploy into (e.g. us-east-1, eu-west-1, ap-southeast-1). | `string` | `"us-east-1"` | no |
+| <a name="input_cluster_name"></a> [cluster\_name](#input\_cluster\_name) | Name for the EKS cluster. Keep to 14 characters or fewer: the module derives an ElastiCache cluster ID of `<cluster_name>-redis`, and AWS caps ElastiCache IDs at 20 chars. Use only lowercase letters, digits and hyphens: the name is also used for the EKS cluster, which does not accept periods, and in the S3 bucket name `n8n-<cluster_name>-<id>`, which does not accept uppercase letters or underscores. The module rejects uppercase letters and underscores at plan time. | `string` | `"n8n-cluster"` | no |
+| <a name="input_customer_managed_redis_auth_token"></a> [customer\_managed\_redis\_auth\_token](#input\_customer\_managed\_redis\_auth\_token) | AUTH token for the stand-in replication group this example creates. Deliberately a plain variable, not a generated random\_password: a real customer-managed Redis's AUTH token is already a known secret the caller holds, not something Terraform generates in the same apply. That distinction is load-bearing here, not stylistic: this value is wired both into the stand-in's own auth\_token argument and into the module's redis\_auth\_token, and the module gates a resource count on whether redis\_auth\_token is null. A count expression can never depend on a value unknown until apply, which a fresh random\_password.result always is on its first create; wiring one in here would break terraform apply for every user of this example, not just its tests. The default below is fine for a disposable demo stack; generate and manage your own token for anything that outlives one terraform destroy. Must satisfy ElastiCache's AUTH constraints: 16-128 printable characters, and the only permitted non-alphanumerics are ! & # $ ^ < > -. https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth.html | `string` | `"customer-managed-demo-auth-token-change-me-1234"` | no |
+| <a name="input_customer_managed_redis_node_type"></a> [customer\_managed\_redis\_node\_type](#input\_customer\_managed\_redis\_node\_type) | ElastiCache node type for the stand-in replication group this example creates. cache.t3.micro is the cheapest node type that supports encryption in transit; a real customer-managed Redis would be sized for its own workload, not this example's. | `string` | `"cache.t3.micro"` | no |
+| <a name="input_db_backup_retention_period"></a> [db\_backup\_retention\_period](#input\_db\_backup\_retention\_period) | Number of whole days to retain automated RDS backups. A value of 0 disables automated backups and point-in-time recovery. Passed to the module's db\_backup\_retention\_period. Leave null (the default) to use the module's default of 7 days. | `number` | `null` | no |
+| <a name="input_db_delete_automated_backups"></a> [db\_delete\_automated\_backups](#input\_db\_delete\_automated\_backups) | Passed to the module's db\_delete\_automated\_backups. Leave null (the default) to use the module's teardown-friendly default of true. | `bool` | `null` | no |
+| <a name="input_db_deletion_protection"></a> [db\_deletion\_protection](#input\_db\_deletion\_protection) | Passed to the module's db\_deletion\_protection. Leave null (the default) to use the module's teardown-friendly default of false. | `bool` | `null` | no |
+| <a name="input_db_final_snapshot_identifier"></a> [db\_final\_snapshot\_identifier](#input\_db\_final\_snapshot\_identifier) | Passed to the module's db\_final\_snapshot\_identifier. Required when db\_skip\_final\_snapshot is false; must be left null otherwise, or the module rejects the plan. | `string` | `null` | no |
+| <a name="input_db_skip_final_snapshot"></a> [db\_skip\_final\_snapshot](#input\_db\_skip\_final\_snapshot) | Passed to the module's db\_skip\_final\_snapshot. Leave null (the default) to use the module's teardown-friendly default of true. | `bool` | `null` | no |
+| <a name="input_n8n_additional_domains"></a> [n8n\_additional\_domains](#input\_n8n\_additional\_domains) | Extra hostnames n8n should answer on, beyond n8n\_domain. Each is added to the module-issued ACM certificate as a subject alternative name, given a Route 53 validation record and alias A-record, and routed by the module's Ingress. Leave empty for a single hostname. | `list(string)` | `[]` | no |
+| <a name="input_n8n_custom_extensions_path"></a> [n8n\_custom\_extensions\_path](#input\_n8n\_custom\_extensions\_path) | Absolute path inside the n8n container that n8n scans for custom nodes at startup (e.g. "/opt/n8n-nodes"). Maps to N8N\_CUSTOM\_EXTENSIONS, and is set on main, worker and webhook processor pods alike. Set this alongside n8n\_image\_repository when the custom image bakes community packages in: since n8n 1.0 the loader no longer reads the image's global node\_modules, so a plain npm install into the image is never scanned and the packages ship but never load. Nodes found here register under the package name CUSTOM, so a node installed from npm as n8n-nodes-example.myNode becomes CUSTOM.myNode and existing workflows referencing the npm-qualified type will not resolve. Leave null (the default) to omit the env var. | `string` | `null` | no |
+| <a name="input_n8n_domain"></a> [n8n\_domain](#input\_n8n\_domain) | Fully-qualified domain name for n8n (e.g. n8n.example.com). The parent zone must be hosted in Route53 (pass its ID via route53\_zone\_id). | `string` | n/a | yes |
+| <a name="input_n8n_execution_data_storage_mode"></a> [n8n\_execution\_data\_storage\_mode](#input\_n8n\_execution\_data\_storage\_mode) | Where n8n stores the data of each new execution. Passed to the module's n8n\_execution\_data\_storage\_mode. "database" keeps execution data in PostgreSQL; "s3" offloads it to the S3 bucket the module already creates for binary data. Requires n8n >= 2.27 (pin n8n\_image\_tag accordingly) and an Enterprise license carrying the feat:executionDataS3 entitlement, which is not the same one binary data offload uses. There is no backfill: existing executions stay readable where they were written. | `string` | `"database"` | no |
+| <a name="input_n8n_extra_ca_pem"></a> [n8n\_extra\_ca\_pem](#input\_n8n\_extra\_ca\_pem) | Passed to the module's n8n\_extra\_ca\_pem: PEM CA certificate(s) trusted by the main, worker and webhook-processor pods for outbound TLS, for a TLS-inspecting egress proxy or a private CA; task-runner sidecars are not covered. Certificates only, never a private key. Leave null (the default) to add none. See [TLS proxy guide](../../docs/tls-proxy.md). | `string` | `null` | no |
+| <a name="input_n8n_extra_env"></a> [n8n\_extra\_env](#input\_n8n\_extra\_env) | Passed to the module's n8n\_extra\_env: extra environment variables for the n8n containers on every role (main, worker, webhook processor), not the task runner sidecars, e.g. HTTP\_PROXY, HTTPS\_PROXY and NO\_PROXY for an egress proxy. The module rejects names it manages. Values are stored in plaintext in Terraform state and the Helm release, so never embed credentials in a proxy URL (http://user:pass@proxy). See [TLS proxy guide](../../docs/tls-proxy.md). | <pre>list(object({<br/>    name  = string<br/>    value = string<br/>  }))</pre> | `[]` | no |
+| <a name="input_n8n_image_pull_secrets"></a> [n8n\_image\_pull\_secrets](#input\_n8n\_image\_pull\_secrets) | Names of existing Kubernetes secrets of type kubernetes.io/dockerconfigjson, in the n8n namespace, that the pods authenticate to their image registry with. Leave empty (the default) unless n8n\_image\_repository points somewhere the node group's IAM role cannot already reach: a public registry and an ECR repository in this account both pull without credentials. Setting it hands ownership of the n8n ServiceAccount from the Helm chart to the module, which is how the secrets reach the pods at all, since the pinned chart renders imagePullSecrets nowhere. Create and rotate the secrets yourself; the module takes names, not credentials, so none of them land in Terraform state. Cross-account ECR is the exception and should not use this: its authorization tokens expire after 12 hours, so add the node group role to the source repository's policy instead. | `list(string)` | `[]` | no |
+| <a name="input_n8n_image_repository"></a> [n8n\_image\_repository](#input\_n8n\_image\_repository) | Container image repository for the n8n application, without a tag (e.g. "123456789012.dkr.ecr.eu-west-1.amazonaws.com/n8n"). Leave null to use the Helm chart's own repository (docker.n8n.io/n8nio/n8n). Set this to run a custom image, for example one with community packages baked in so they are not reinstalled on every pod boot. The image must be pullable by the node group's IAM role (ECR in the same account is) or be public, otherwise name a dockerconfigjson secret in n8n\_image\_pull\_secrets, and n8n\_task\_runner\_image\_tag usually has to be set alongside it. | `string` | `null` | no |
+| <a name="input_n8n_image_tag"></a> [n8n\_image\_tag](#input\_n8n\_image\_tag) | n8n application image tag to deploy (e.g. "2.27.4"). Leave null to use the selected Helm chart's default (appVersion 2.43.5 in chart 1.16.0). Inspect and pin the running application version before upgrading the chart to avoid a downgrade; see the [upgrade guide](../../docs/upgrading-n8n.md). | `string` | `null` | no |
+| <a name="input_n8n_license_key"></a> [n8n\_license\_key](#input\_n8n\_license\_key) | n8n license activation key. Requires Enterprise with feat:multipleMainInstances by default; Business is supported with n8n\_main\_hpa\_min\_replicas = 1. Get one at https://n8n.io/pricing | `string` | n/a | yes |
+| <a name="input_n8n_main_hpa_min_replicas"></a> [n8n\_main\_hpa\_min\_replicas](#input\_n8n\_main\_hpa\_min\_replicas) | Minimum (and therefore default) replica count for n8n main pods, passed straight through to the module's own n8n\_main\_hpa\_min\_replicas. Leave null (the default) to use the module's default of 2 (multi-main, needs an Enterprise/Startup license carrying feat:multipleMainInstances). Set to 1 to run a single main pod in plain queue mode instead, which only needs a Business-tier license: n8n's multi-main leader-election gate never engages at 1 replica. | `number` | `null` | no |
+| <a name="input_n8n_proxy_hops"></a> [n8n\_proxy\_hops](#input\_n8n\_proxy\_hops) | Passed to the module's n8n\_proxy\_hops: number of proxies in front of n8n that add an X-Forwarded-For entry (the module's own ALB counts as 1, an additional proxy or WAF that adds its own entry makes 2). At any hop count of 1 or more, a caller that bypasses the declared proxy chain can forge X-Forwarded-For and spoof its client IP, including an in-cluster caller that reaches the n8n Services directly. When a proxy sits in front of the ALB, restrict the ALB to that proxy's egress addresses with the module's alb\_inbound\_cidrs or alb\_inbound\_prefix\_list\_ids input, which this example does not pass through (add it in main.tf), and keep in-cluster callers off the n8n Services. Leave null (the default) to use the module's default of 1. See [TLS proxy guide](../../docs/tls-proxy.md). | `number` | `null` | no |
+| <a name="input_n8n_task_runner_image_repository"></a> [n8n\_task\_runner\_image\_repository](#input\_n8n\_task\_runner\_image\_repository) | Container image repository for the task runner sidecar (n8nio/runners), without a tag or digest (e.g. "123456789012.dkr.ecr.eu-west-1.amazonaws.com/n8n-runners"). Leave null to use the Helm chart's own repository (n8nio/runners). Set alongside n8n\_image\_repository when mirroring both images into the same private registry; the two are independent. Use n8n\_task\_runner\_image\_tag for the runner tag. Private-registry pull access is granted the same way as n8n\_image\_repository, through n8n\_image\_pull\_secrets on the module-managed ServiceAccount. | `string` | `null` | no |
+| <a name="input_n8n_task_runner_image_tag"></a> [n8n\_task\_runner\_image\_tag](#input\_n8n\_task\_runner\_image\_tag) | Image tag for the task runner sidecar (`n8nio/runners`). Leave null to inherit the n8n application image's tag, which is correct as long as that tag is a published n8n version. Set it to the underlying n8n version when running a custom image whose tag is not one (e.g. n8n\_image\_tag = "2.27.4-mypackages" together with n8n\_task\_runner\_image\_tag = "2.27.4"); otherwise the sidecar image cannot be pulled and every pod carrying a runner stays in ImagePullBackOff (workers only in upstream chart 1.16.0 queue mode). | `string` | `null` | no |
+| <a name="input_route53_zone_id"></a> [route53\_zone\_id](#input\_route53\_zone\_id) | Route53 hosted zone ID for the parent of n8n\_domain (e.g. the zone for example.com if n8n\_domain = n8n.example.com). The module creates the ACM certificate, validation records, and alias A-record inside this zone. | `string` | n/a | yes |
+| <a name="input_s3_force_destroy"></a> [s3\_force\_destroy](#input\_s3\_force\_destroy) | Passed to the module's s3\_force\_destroy. Leave null (the default) to use the module's teardown-friendly default of true. | `bool` | `null` | no |
+| <a name="input_tags"></a> [tags](#input\_tags) | Additional AWS tags to apply to every resource this example creates. | `map(string)` | `{}` | no |
+
+## Outputs
+
+| Name | Description |
+| ---- | ----------- |
+| <a name="output_alb_hostname"></a> [alb\_hostname](#output\_alb\_hostname) | ALB hostname. The alias A-record for n8n\_domain is already created in Route53. This output is informational. |
+| <a name="output_customer_managed_redis_endpoint"></a> [customer\_managed\_redis\_endpoint](#output\_customer\_managed\_redis\_endpoint) | Primary endpoint of the stand-in replication group this example creates, playing the part of a customer's existing Redis. This is the value that fills module.n8n's redis\_host in this example; in a real deployment it would be your own Redis's endpoint instead. |
+| <a name="output_db_password"></a> [db\_password](#output\_db\_password) | RDS PostgreSQL password. Back this up in a password manager. |
+| <a name="output_kubectl_config_command"></a> [kubectl\_config\_command](#output\_kubectl\_config\_command) | Command to configure kubectl for this cluster. |
+| <a name="output_n8n_encryption_key"></a> [n8n\_encryption\_key](#output\_n8n\_encryption\_key) | n8n encryption key. Back this up in a password manager. |
+| <a name="output_n8n_url"></a> [n8n\_url](#output\_n8n\_url) | URL to access n8n once the ALB finishes provisioning (~5 min after apply). |
+| <a name="output_namespace"></a> [namespace](#output\_namespace) | Kubernetes namespace n8n is deployed into. |
+<!-- END_TF_DOCS -->

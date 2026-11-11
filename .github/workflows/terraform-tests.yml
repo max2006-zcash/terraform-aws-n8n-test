@@ -1,0 +1,403 @@
+name: Terraform Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # Every job except test-floor runs this version: the current latest stable,
+  # so there is one deliberately tracked latest version to bump rather than a
+  # moving target. TF_FLOOR_VERSION below tracks the module's floor instead.
+  TF_VERSION: "1.16.6"
+  # The `test-floor` job also runs the `terraform test` suites on the lowest
+  # release the module's required_version admits. A floor CI never runs is a
+  # claim nobody is checking: on the previous `>= 1.11` floor, two validations
+  # (#167, #175) broke on 1.11 and passed here, because && and || only
+  # short-circuit from Terraform 1.12. The floor is 1.13 rather than 1.12
+  # because `terraform test` on 1.12.x and older leaks about one provider
+  # process per run block, which exhausts a 16 GB runner on the root suite
+  # (see versions.tf). Must be X.Y.0 for a `>= X.Y` floor, and
+  # move together with all thirteen required_version declarations;
+  # tests/scripts/check-terraform-floor.sh fails the job otherwise.
+  TF_FLOOR_VERSION: "1.13.0"
+  TFLINT_VERSION: "v0.64.0"
+  # Tracks the version `brew install markdownlint-cli` installs, so
+  # contributors don't need a special install path — the same trap
+  # TERRAFORM_DOCS_VERSION and CHECKOV_VERSION call out above: a CI pin that
+  # drifts from what contributors actually run produces spurious diffs
+  # between "clean locally" and "clean in CI".
+  MARKDOWNLINT_VERSION: "0.49.1"
+  # checkov results are version-dependent, so this gate pins one version rather
+  # than tracking latest. tests/scripts/check-checkov.sh reads this value and
+  # refuses to run against a different local version, which makes this line the
+  # single source of truth for both. Bumping it is a deliberate change: expect a
+  # new release to report findings that need triaging in the same commit.
+  # Held at 3.3.20: 3.3.28 and later fail the opt-in pass on a correct
+  # resource. See #193 before bumping.
+  CHECKOV_VERSION: "3.3.20"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # Shared provider plugin cache across the validate/test/tflint matrices.
+  # `terraform init` fills this from the registry on a cache miss and reuses
+  # it on a hit, keyed below on the .terraform.lock.hcl files committed at
+  # the module root and in each examples/* root module.
+  TF_PLUGIN_CACHE_DIR: "${{ github.workspace }}/.terraform-plugin-cache"
+
+jobs:
+  fmt:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt -check -recursive
+        run: terraform fmt -check -recursive -diff
+
+  docs:
+    name: terraform-docs (README in sync)
+    runs-on: ubuntu-latest
+    env:
+      # Tracks the version `brew install terraform-docs` installs on macOS, so
+      # contributors don't need a special install path. Different terraform-docs
+      # versions emit different markdown table whitespace, so any drift between
+      # CI and the version contributors actually use produces spurious diffs in
+      # the --output-check steps below. Bump together with the brew default:
+      # this pin sat at v0.22.0 while brew moved to v0.24.0, which is the same
+      # trap the floating checkov version fell into (see CHECKOV_VERSION above).
+      # It happened to be harmless here, because the two versions render this
+      # repo's tables identically, but that was luck rather than design.
+      TERRAFORM_DOCS_VERSION: v0.24.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install terraform-docs
+        run: |
+          set -euo pipefail
+          curl -sSLo /tmp/td.tar.gz \
+            "https://terraform-docs.io/dl/${TERRAFORM_DOCS_VERSION}/terraform-docs-${TERRAFORM_DOCS_VERSION}-$(uname)-amd64.tar.gz"
+          tar -xzf /tmp/td.tar.gz -C /tmp terraform-docs
+          sudo install -m 0755 /tmp/terraform-docs /usr/local/bin/terraform-docs
+          terraform-docs --version
+
+      # All formatting options live in .terraform-docs.yml so these commands
+      # stay identical to what contributors run locally.
+      - name: terraform-docs --output-check (root)
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/small)
+        working-directory: examples/small
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/cloudflare)
+        working-directory: examples/cloudflare
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/godaddy)
+        working-directory: examples/godaddy
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/medium)
+        working-directory: examples/medium
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/large)
+        working-directory: examples/large
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/split-ingress)
+        working-directory: examples/split-ingress
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/worker-pools)
+        working-directory: examples/worker-pools
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/customer-managed-redis)
+        working-directory: examples/customer-managed-redis
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/customer-managed-s3)
+        working-directory: examples/customer-managed-s3
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/customer-managed-cluster)
+        working-directory: examples/customer-managed-cluster
+        run: terraform-docs --output-check .
+
+      - name: terraform-docs --output-check (examples/customer-managed-everything)
+        working-directory: examples/customer-managed-everything
+        run: terraform-docs --output-check .
+
+  validate:
+    name: terraform validate (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [".", "examples/small", "examples/cloudflare", "examples/godaddy", "examples/medium", "examples/large", "examples/split-ingress", "examples/worker-pools", "examples/customer-managed-redis", "examples/customer-managed-s3", "examples/customer-managed-cluster", "examples/customer-managed-everything"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: cache terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-providers-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: tf-providers-
+
+      - name: terraform init (no backend, providers only)
+        working-directory: ${{ matrix.target }}
+        run: mkdir -p "$TF_PLUGIN_CACHE_DIR" && terraform init -backend=false
+
+      - name: terraform validate
+        working-directory: ${{ matrix.target }}
+        run: terraform validate -no-color
+
+  test:
+    name: terraform test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: validate
+    env:
+      # Stub credentials so the veksh/godaddy-dns provider initializes during
+      # terraform test. Scoped to this job only: no real GoDaddy API calls
+      # are made; godaddy-dns_record resources use for_each over unknown ACM
+      # domain_validation_options, which evaluates to an empty map under a
+      # mocked AWS provider. Other jobs (fmt, validate, tflint, checkov)
+      # don't need these set.
+      GODADDY_API_KEY: "ci-stub-not-real"
+      GODADDY_API_SECRET: "ci-stub-not-real"
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [".", "examples/small", "examples/cloudflare", "examples/godaddy", "examples/medium", "examples/large", "examples/split-ingress", "examples/worker-pools", "examples/customer-managed-redis", "examples/customer-managed-s3", "examples/customer-managed-cluster", "examples/customer-managed-everything"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: cache terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-providers-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: tf-providers-
+
+      - name: terraform init
+        working-directory: ${{ matrix.target }}
+        run: mkdir -p "$TF_PLUGIN_CACHE_DIR" && terraform init -backend=false
+
+      - name: terraform test
+        working-directory: ${{ matrix.target }}
+        run: terraform test -verbose
+
+  # The same suites as `test`, on TF_FLOOR_VERSION instead of TF_VERSION. A
+  # separate job rather than a matrix dimension on `test`, so the existing
+  # check names stay unchanged and each version is defined once (matrix values
+  # cannot read `env`).
+  test-floor:
+    name: terraform test on floor (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+    env:
+      # Same stub credentials as the `test` job, for the same reason.
+      GODADDY_API_KEY: "ci-stub-not-real"
+      GODADDY_API_SECRET: "ci-stub-not-real"
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [".", "examples/small", "examples/cloudflare", "examples/godaddy", "examples/medium", "examples/large", "examples/split-ingress", "examples/worker-pools", "examples/customer-managed-redis", "examples/customer-managed-s3", "examples/customer-managed-cluster", "examples/customer-managed-everything"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: required_version matches TF_FLOOR_VERSION
+        if: matrix.target == '.'
+        run: tests/scripts/check-terraform-floor.sh
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_FLOOR_VERSION }}
+
+      - name: cache terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-providers-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: tf-providers-
+
+      - name: terraform init
+        working-directory: ${{ matrix.target }}
+        run: mkdir -p "$TF_PLUGIN_CACHE_DIR" && terraform init -backend=false
+
+      - name: terraform test
+        working-directory: ${{ matrix.target }}
+        run: terraform test -verbose
+
+  chart:
+    name: main topology chart rendering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.1
+
+      - name: cache terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-providers-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: tf-providers-
+
+      - name: terraform init
+        run: mkdir -p "$TF_PLUGIN_CACHE_DIR" && terraform init -backend=false
+
+      - name: render and check main topology
+        run: tests/scripts/check-main-chart.sh
+
+  chart-coverage:
+    name: helm-chart-coverage.md is not stale
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.1
+
+      - name: check docs/helm-chart-coverage.md against the pinned chart
+        run: tests/scripts/check-helm-chart-coverage.sh
+
+  # Offline and fast: no network and no cloud credentials, only python3, which
+  # the runner image carries. It exists so a change to the drift script's
+  # constraint evaluator is exercised on every pull request instead of only when
+  # someone remembers to run it locally.
+  drift-constraints:
+    name: drift-check constraint evaluator tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: unit-test the drift script's version-constraint evaluator
+        run: tests/scripts/test-version-drift-constraints.sh
+
+  tflint:
+    name: tflint (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [".", "examples/small", "examples/cloudflare", "examples/godaddy", "examples/medium", "examples/large", "examples/split-ingress", "examples/worker-pools", "examples/customer-managed-redis", "examples/customer-managed-s3", "examples/customer-managed-cluster", "examples/customer-managed-everything"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: cache terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-providers-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: tf-providers-
+
+      - name: terraform init (fetch modules for tflint)
+        working-directory: ${{ matrix.target }}
+        run: mkdir -p "$TF_PLUGIN_CACHE_DIR" && terraform init -backend=false
+
+      - name: tflint --init
+        working-directory: ${{ matrix.target }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: tflint --init
+
+      - name: tflint
+        working-directory: ${{ matrix.target }}
+        run: tflint --format compact
+
+  checkov:
+    name: checkov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.11 is the interpreter the pinned checkov was verified against, and the
+      # one bridgecrewio's own checkov image ships.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Installed at a pinned version instead of via bridgecrewio/checkov-action,
+      # which bakes the checkov version into its own image: the @v12 tag moves to
+      # newer checkov releases on its own schedule. That is not a theoretical
+      # problem. 3.3.9 (a past pin here) evaluated whole check families (all the
+      # checks, several CKV2_* graph checks) against resources reached through a
+      # local module source that 3.3.0 skipped silently, which turned a clean
+      # local run into ten CI failures on findings nobody had triaged. With this
+      # gate at hard-fail, the version has to move only in a deliberate commit
+      # that also curates whatever the new release reports.
+      - name: install checkov
+        run: pip install "checkov==${{ env.CHECKOV_VERSION }}"
+
+      # The same script contributors run, so "clean locally" and "clean in CI"
+      # cannot drift apart: it owns the flags, the config file and the exit code.
+      # Every finding is curated, either fixed or annotated at the resource with
+      # an inline `checkov:skip=<ID>:<reason>`. See issue #27 and CHANGELOG.md.
+      # checkov exits non-zero on any new finding, which fails the job.
+      - name: checkov
+        run: tests/scripts/check-checkov.sh
+
+  markdownlint:
+    name: markdownlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 20 LTS reached end-of-life April 2026; 24 is the current Active
+      # LTS. This job only runs `npm install -g markdownlint-cli`, so bump
+      # freely whenever the active LTS moves on — no compatibility contract
+      # to preserve here.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: install markdownlint-cli
+        run: npm install --global "markdownlint-cli@${{ env.MARKDOWNLINT_VERSION }}"
+
+      # Same file set and config as `task markdown` (see Taskfile.yml):
+      # README.md, CONTRIBUTING.md, AGENTS.md, docs/*.md. Never CHANGELOG.md —
+      # every Keep a Changelog release heading and `.tf`-derived content in
+      # this repo trips false positives that aren't worth curating.
+      # AGENTS.md's "Static analysis" section documents the one exception
+      # that is worth curating: the terraform-docs generated README block,
+      # wrapped in markdownlint-disable/restore. Rules live in .markdownlint.jsonc.
+      - name: markdownlint
+        run: markdownlint README.md CONTRIBUTING.md AGENTS.md docs/*.md

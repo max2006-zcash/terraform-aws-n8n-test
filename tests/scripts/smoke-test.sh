@@ -1,0 +1,1277 @@
+#!/usr/bin/env bash
+# smoke-test.sh — post-deployment smoke test for terraform-aws-n8n.
+#
+# This module deploys queue mode (main + worker + webhook-processor pods,
+# PostgreSQL, Redis, KEDA), and that is the only topology this script tests:
+# main/worker/webhook-processor pod health, queue mode, Redis connectivity,
+# KEDA ScaledObject, HTTPS, API, and end-to-end execution. A missing
+# n8n-worker Deployment is a failure, not a different kind of install. The
+# main topology is detected from N8N_MULTI_MAIN_SETUP_ENABLED on the main
+# Deployment: unset means single-main (n8n_main_hpa_min_replicas = 1,
+# Business-tier path) and the script then asserts HPA min=max=1, Recreate and
+# no main PDB (chart 1.16.0+) or PDB minAvailable=0 (older charts) instead of
+# the multi-main leader-election checks.
+#
+# Usage:
+#   # Run from the example directory — outputs are read automatically:
+#   cd examples/small
+#   ../../tests/scripts/smoke-test.sh
+#
+#   # Or point at a Terraform directory explicitly:
+#   TERRAFORM_DIR=examples/small ./tests/scripts/smoke-test.sh
+#
+#   # Override any value by setting it in .env (next to this script,
+#   # or next to terraform.tfstate):
+#   cp tests/scripts/.env.example tests/scripts/.env
+#   # edit .env, then run the script.
+#
+# Priority: .env explicit values > Terraform outputs > built-in defaults.
+
+set -euo pipefail
+
+# ── Load .env ─────────────────────────────────────────────────────────────────
+# Look for .env in (1) the script's own directory, then (2) the current working
+# directory (TERRAFORM_DIR). This lets you keep secrets next to the Terraform
+# files rather than alongside the script.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+for _env_candidate in "$SCRIPT_DIR/.env" "$(pwd)/.env"; do
+  if [[ -f "$_env_candidate" ]]; then
+    # shellcheck disable=SC1090
+    set -a; source "$_env_candidate"; set +a
+    break
+  fi
+done
+
+# ── Read from Terraform outputs ───────────────────────────────────────────────
+# Default TERRAFORM_DIR to the current working directory so running the script
+# from inside a terraform directory just works.
+
+TERRAFORM_DIR="${TERRAFORM_DIR:-$(pwd)}"
+
+if command -v terraform &>/dev/null && [[ -f "$TERRAFORM_DIR/terraform.tfstate" ]]; then
+  echo -e "\033[0;36m↳\033[0m  Reading values from Terraform state in: $TERRAFORM_DIR"
+
+  tf_namespace=$(terraform -chdir="$TERRAFORM_DIR" output -raw namespace 2>/dev/null || true)
+  tf_n8n_url=$(terraform -chdir="$TERRAFORM_DIR" output -raw n8n_url 2>/dev/null || true)
+  tf_kubectl_cmd=$(terraform -chdir="$TERRAFORM_DIR" output -raw kubectl_config_command 2>/dev/null || true)
+
+  # Only apply if not already set via .env / environment
+  NAMESPACE="${NAMESPACE:-$tf_namespace}"
+  N8N_URL="${N8N_URL:-$tf_n8n_url}"
+
+  echo -e "\033[0;36m↳\033[0m  namespace = ${NAMESPACE:-<not found>}"
+  echo -e "\033[0;36m↳\033[0m  n8n_url   = ${N8N_URL:-<not found>}"
+
+  # Switch kubectl context to the cluster from this Terraform deployment.
+  # Required when multiple clusters are configured — avoids running against
+  # the wrong cluster if the context was last pointed elsewhere.
+  if [[ -n "$tf_kubectl_cmd" ]]; then
+    echo -e "\033[0;36m↳\033[0m  Switching kubectl context: $tf_kubectl_cmd"
+    eval "$tf_kubectl_cmd" &>/dev/null
+  fi
+
+  echo ""
+fi
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+NAMESPACE="${NAMESPACE:-${N8N_NAMESPACE:-n8n}}"
+N8N_URL="${N8N_URL:-}"
+N8N_API_KEY="${N8N_API_KEY:-}"
+MAIN_TOPOLOGY="multi-main"            # 'single-main' when N8N_MULTI_MAIN_SETUP_ENABLED is unset (detected below)
+
+# Optional load test settings
+LOAD_TEST="${LOAD_TEST:-false}"
+LOAD_REQUESTS="${LOAD_REQUESTS:-100}"
+LOAD_CONCURRENCY="${LOAD_CONCURRENCY:-20}"
+LOAD_SEED_JOBS="${LOAD_SEED_JOBS:-20}"   # jobs queued in phase 1 to trigger the autoscaler
+SCALE_WAIT_SECS="${SCALE_WAIT_SECS:-180}"
+LOAD_JOB_DURATION_SECS="${LOAD_JOB_DURATION_SECS:-10}"
+
+# Expected minimum replica counts for queue-mode deployments. MAIN_MIN drops
+# to 1 when the module runs single-main (n8n_main_hpa_min_replicas = 1); see
+# the topology detection below.
+MAIN_MIN=2
+WORKER_MIN=1
+WEBHOOK_MIN=2
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+PASS=0
+FAIL=0
+WARN=0
+SKIPPED=0
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+header() { echo -e "\n${BOLD}${CYAN}══ $* ══${RESET}"; }
+pass()   { echo -e "  ${GREEN}✔${RESET}  $*"; PASS=$((PASS + 1)); }
+fail()   { echo -e "  ${RED}✘${RESET}  $*"; FAIL=$((FAIL + 1)); }
+warn()   { echo -e "  ${YELLOW}⚠${RESET}  $*"; WARN=$((WARN + 1)); }
+skip()   { echo -e "  ${YELLOW}–${RESET}  $* ${YELLOW}(skipped)${RESET}"; SKIPPED=$((SKIPPED + 1)); }
+info()   { echo -e "      ${CYAN}↳${RESET} $*"; }
+
+require_cmd() {
+  if ! command -v "$1" &>/dev/null; then
+    echo -e "${RED}ERROR: required command '$1' not found.${RESET}" >&2
+    exit 1
+  fi
+}
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+
+header "Preflight"
+
+require_cmd kubectl
+require_cmd curl
+require_cmd python3
+
+if ! kubectl cluster-info &>/dev/null; then
+  echo -e "${RED}ERROR: kubectl cannot reach the cluster. Check your kubeconfig / credentials.${RESET}" >&2
+  exit 1
+fi
+pass "kubectl cluster connectivity"
+
+if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+  fail "Namespace '$NAMESPACE' does not exist"
+  exit 1
+fi
+pass "Namespace '$NAMESPACE' exists"
+
+if [[ -z "$N8N_URL" ]]; then
+  warn "N8N_URL not set — HTTP and API tests will be skipped"
+  warn "  Set N8N_URL=https://your-domain.com to enable them"
+fi
+
+if [[ -z "$N8N_API_KEY" ]]; then
+  warn "N8N_API_KEY not set — workflow execution test will be skipped"
+  warn "  Create one in n8n: Settings > API > Create API Key"
+fi
+
+# ── Queue mode and main topology ──────────────────────────────────────────────
+
+header "Queue Mode and Main Topology"
+
+# This module always runs queue mode (n8n.tf hardcodes queueMode.enabled =
+# true) and always renders the worker Deployment, even at
+# n8n_worker_keda_min_replicas = 0 (#146). A missing n8n-worker is therefore
+# a broken deployment, not a different kind of install. It fails here once
+# (missing or unreadable), and checks that need a worker skip below with
+# "reported above" instead of failing again.
+worker_unavailable=false
+if worker_get_err=$(kubectl get deployment n8n-worker -n "$NAMESPACE" 2>&1 >/dev/null); then
+  pass "Queue-mode deployment detected (n8n-worker present)"
+elif [[ "$worker_get_err" == *"NotFound"* ]]; then
+  fail "Deployment 'n8n-worker' not found: this module always renders it, so the deployment is broken"
+  worker_unavailable=true
+  info "Check: helm status n8n -n $NAMESPACE, and kubectl get deploy -n $NAMESPACE"
+else
+  fail "Cannot read Deployment n8n-worker in namespace $NAMESPACE"
+  worker_unavailable=true
+  info "$worker_get_err"
+fi
+
+# The module runs one main pod without leader election when
+# n8n_main_hpa_min_replicas = 1 (Business-tier path). The topology signal
+# is the switch itself, N8N_MULTI_MAIN_SETUP_ENABLED on the main Deployment
+# spec, read from the spec rather than a pod so it works before the pod is
+# Ready. The chart only adds this env entry at all when
+# multiMain.enabled && license.enabled (n8n-helm-chart
+# templates/_configmap-env.tpl), and always via valueFrom.configMapKeyRef,
+# never a literal value, so detection checks the entry's presence (.name),
+# not a `.value` the chart never populates; querying `.value` here returned
+# empty for every topology and silently misdetected multi-main (the
+# module's own default) as single-main. The HPA clamp, strategy, and PDB
+# are then asserted, not used for detection, so a regression in any of them
+# fails instead of silently selecting the other branch.
+# An unreadable Deployment must not be mistaken for "flag unset".
+main_deploy_readable=true
+if ! multi_main_flag=$(kubectl get deployment n8n-main -n "$NAMESPACE" \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="n8n-main")].env[?(@.name=="N8N_MULTI_MAIN_SETUP_ENABLED")].name}' \
+    2>/dev/null); then
+  main_deploy_readable=false
+  multi_main_flag=""
+  fail "Cannot read Deployment n8n-main in namespace $NAMESPACE — topology unknown, falling back to multi-main checks"
+fi
+if [[ "$main_deploy_readable" == false || -n "$multi_main_flag" ]]; then
+  MAIN_TOPOLOGY="multi-main"
+  info "Multi-main topology (N8N_MULTI_MAIN_SETUP_ENABLED present on main Deployment)"
+else
+  MAIN_TOPOLOGY="single-main"
+  MAIN_MIN=1
+  info "Single-main topology (N8N_MULTI_MAIN_SETUP_ENABLED absent): expecting HPA 1/1, Recreate, no main PDB (chart 1.16.0+) or PDB minAvailable=0 (older charts)"
+fi
+info "Checks: queue mode, HPA/KEDA, Redis, main topology"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QUEUE-MODE CHECKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Pod health ─────────────────────────────────────────────────────────────────
+
+header "Pod Health"
+
+check_deployment() {
+  local name="$1"
+  local min_replicas="$2"
+  local label="$3"
+  # Pods carry the chart's component label without the release prefix
+  # (main, worker, webhook-processor), not the Deployment name.
+  local component="${name#n8n-}"
+
+  if ! kubectl get deployment "$name" -n "$NAMESPACE" &>/dev/null; then
+    # An unavailable worker was already failed once at the mode guard.
+    if [[ "$name" == n8n-worker && "$worker_unavailable" == true ]]; then
+      return
+    fi
+    fail "Deployment '$name' not found"
+    return
+  fi
+
+  # A failed read must not become 0: with a worker floor of 0, "0/0 ready"
+  # is a pass, so an unreadable Deployment would otherwise pass silently.
+  # An absent readyReplicas on a successful read does mean 0.
+  local ready desired
+  if ! ready=$(kubectl get deployment "$name" -n "$NAMESPACE" \
+      -o jsonpath='{.status.readyReplicas}' 2>/dev/null) \
+    || ! desired=$(kubectl get deployment "$name" -n "$NAMESPACE" \
+      -o jsonpath='{.spec.replicas}' 2>/dev/null) \
+    || [[ -z "$desired" ]]; then
+    fail "$label: cannot read replica counts of Deployment '$name'"
+    return
+  fi
+  ready="${ready:-0}"
+
+  # At a KEDA floor of 0, 0/N ready means a worker is starting from zero
+  # (a job arrived just before or during this check), which is normal, not
+  # broken. Wait for it the way the execution test does, re-reading both
+  # counts, since KEDA may also scale back to 0 in the meantime.
+  if [[ "$min_replicas" -eq 0 && "$ready" -eq 0 && "$desired" -gt 0 ]]; then
+    info "$label: 0/$desired ready at a KEDA floor of 0, so one is starting from zero; waiting up to 180s"
+    local waited=0
+    while [[ "$waited" -lt 180 && "$ready" -eq 0 && "$desired" -gt 0 ]]; do
+      sleep 10
+      waited=$((waited + 10))
+      if ! ready=$(kubectl get deployment "$name" -n "$NAMESPACE" \
+          -o jsonpath='{.status.readyReplicas}' 2>/dev/null) \
+        || ! desired=$(kubectl get deployment "$name" -n "$NAMESPACE" \
+          -o jsonpath='{.spec.replicas}' 2>/dev/null) \
+        || [[ -z "$desired" ]]; then
+        fail "$label: cannot read replica counts of Deployment '$name'"
+        return
+      fi
+      ready="${ready:-0}"
+    done
+  fi
+
+  if [[ "$min_replicas" -eq 0 && "$ready" -eq 0 && "$desired" -gt 0 ]]; then
+    # Still 0 ready after the wait. Only one cause is a slow start rather
+    # than breakage: every pod Pending and unschedulable, i.e. waiting for
+    # the Cluster Autoscaler to add a node. Anything else (CrashLoopBackOff,
+    # an image pull error, no pods created, Running but never Ready) means
+    # the worker will not process jobs, so it fails.
+    local pod_states
+    if ! pod_states=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/component=$component" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{" phase="}{.status.phase}{" scheduled="}{.status.conditions[?(@.type=="PodScheduled")].reason}{" waiting="}{.status.containerStatuses[*].state.waiting.reason}{"\n"}{end}' \
+        2>/dev/null); then
+      fail "$label: 0/$desired pods ready after 180s, and its pods cannot be read"
+      return
+    fi
+    if [[ -z "$pod_states" ]]; then
+      fail "$label: 0/$desired pods ready after 180s, and no pods were created"
+      info "Check: kubectl describe deployment $name -n $NAMESPACE (quota, admission, or ReplicaSet errors)"
+    elif ! grep -qv 'phase=Pending scheduled=Unschedulable' <<< "$pod_states"; then
+      warn "$label: 0/$desired pods ready after 180s, all Pending and unschedulable (waiting for a node)"
+      info "Check: kubectl get events -n $NAMESPACE --field-selector reason=TriggeredScaleUp"
+    else
+      fail "$label: 0/$desired pods ready after 180s, and the worker is not just waiting for a node"
+      while IFS= read -r line; do info "$line"; done <<< "$pod_states"
+    fi
+  elif [[ "$ready" -ge "$min_replicas" && "$ready" -eq "$desired" ]]; then
+    pass "$label: $ready/$desired pods ready"
+  elif [[ "$ready" -gt 0 ]]; then
+    warn "$label: only $ready/$desired pods ready (minimum $min_replicas)"
+  else
+    fail "$label: 0/$desired pods ready"
+  fi
+
+  local bad_pods
+  bad_pods=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/component=$component" \
+    --no-headers 2>/dev/null \
+    | awk '{print $1, $3}' \
+    | grep -v "Running\|Completed" || true)
+  if [[ -n "$bad_pods" ]]; then
+    warn "Unhealthy pods detected under $name:"
+    while IFS= read -r line; do info "$line"; done <<< "$bad_pods"
+  fi
+}
+
+# n8n_worker_keda_min_replicas = 0 is a supported floor (#146): the module
+# still renders the worker Deployment and its ScaledObject, and KEDA scales
+# the Deployment to zero while the queue is empty. Read the floor from the
+# ScaledObject so an idle deployment at 0 workers is not reported as broken.
+# At 0 workers, a healthy state needs a Ready, unpaused ScaledObject: that
+# is what brings a worker back when jobs arrive, so it is checked below.
+worker_keda_min=$(kubectl get scaledobject n8n-worker -n "$NAMESPACE" \
+  -o jsonpath='{.spec.minReplicaCount}' 2>/dev/null || true)
+[[ "$worker_keda_min" == "0" ]] && WORKER_MIN=0
+
+# Read live on every call, not once: KEDA can scale 1 -> 0 while the script
+# runs, and a stale answer would fail the Redis probe or shorten the
+# execution wait. A failed read answers "no", which keeps the stricter path.
+worker_scaled_to_zero() {
+  [[ "$WORKER_MIN" == 0 ]] || return 1
+  local replicas
+  replicas=$(kubectl get deployment n8n-worker -n "$NAMESPACE" \
+    -o jsonpath='{.spec.replicas}' 2>/dev/null) || return 1
+  [[ "$replicas" == 0 ]]
+}
+
+# Whether the worker ScaledObject can start a worker right now: "ready",
+# "not_ready" (a broken scaler), or "paused" (n8n_worker_keda_pause). Read
+# live, like worker_scaled_to_zero, and checked in that order.
+worker_scaler_state() {
+  local ready paused
+  ready=$(kubectl get scaledobject n8n-worker -n "$NAMESPACE" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  paused=$(kubectl get scaledobject n8n-worker -n "$NAMESPACE" \
+    -o jsonpath='{.metadata.annotations.autoscaling\.keda\.sh/paused}' 2>/dev/null || true)
+  if [[ "$ready" != "True" ]]; then
+    echo not_ready
+  elif [[ "$paused" == "true" ]]; then
+    echo paused
+  else
+    echo ready
+  fi
+}
+
+if worker_scaled_to_zero; then
+  info "Worker KEDA floor is 0 and the worker Deployment is scaled to zero"
+fi
+
+check_deployment "n8n-main"              "$MAIN_MIN"    "Main pods"
+check_deployment "n8n-worker"            "$WORKER_MIN"  "Worker pods"
+check_deployment "n8n-webhook-processor" "$WEBHOOK_MIN" "Webhook processor pods"
+
+# ── Task runner sidecars (workers only) ───────────────────────────────────────
+
+header "Task Runner Sidecars"
+
+# In queue mode, Code nodes execute on worker pods — the task runner sidecar
+# belongs on workers, not on main or webhook-processor pods.
+if [[ "$worker_unavailable" == true ]]; then
+  skip "Task runner sidecar checks (n8n-worker Deployment unavailable, reported above)"
+else
+  worker_containers=$(kubectl get deployment n8n-worker -n "$NAMESPACE" \
+    -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || echo "")
+
+  if echo "$worker_containers" | grep -qiE "runner"; then
+    runner_container=$(echo "$worker_containers" | tr ' ' '\n' | grep -iE "runner" | head -1)
+    pass "Task runner sidecar present on n8n-worker pods: $runner_container"
+
+    # Confirm sidecar is connected to broker in a running worker pod
+    worker_pod=$(kubectl get pods -n "$NAMESPACE" \
+      -l "app.kubernetes.io/component=worker" \
+      --field-selector=status.phase=Running \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+    if [[ -n "$worker_pod" ]]; then
+      runner_logs=$(kubectl logs "$worker_pod" -n "$NAMESPACE" -c "$runner_container" \
+        --tail=50 2>/dev/null || true)
+      # "Waiting for task broker to be ready..." means NOT connected yet. The
+      # launcher logs nothing on connect; the first sign is "Waiting for
+      # launcher's task offer to be accepted..." (offer only sent once the
+      # broker is reachable), then "[runner:js]" lines once a task runs. The
+      # end-to-end Code node run below is the authoritative runner check.
+      connected_line=$(echo "$runner_logs" \
+        | grep -iE "task offer|\[runner:(js|py)\]" | tail -1 || true)
+      if [[ -n "$connected_line" ]]; then
+        pass "Worker runner sidecar connected to broker"
+        info "$connected_line"
+      else
+        warn "No broker connection confirmation in worker runner logs (last 50 lines)"
+        info "kubectl logs $worker_pod -n $NAMESPACE -c $runner_container"
+      fi
+    fi
+  else
+    warn "Task runner sidecar not found on n8n-worker — task runners may be disabled"
+    info "Set n8n_task_runners_enabled = true in terraform.tfvars and re-apply"
+  fi
+fi
+
+# ── Main topology ─────────────────────────────────────────────────────────────
+
+header "Main Topology"
+
+main_pod=$(kubectl get pods -n "$NAMESPACE" \
+  -l "app.kubernetes.io/component=main" \
+  --field-selector=status.phase=Running \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+if [[ "$MAIN_TOPOLOGY" == "single-main" ]]; then
+  # One main without leader election: the HPA must never allow a second main,
+  # upgrades must use Recreate so two mains never overlap, and node maintenance
+  # must be able to evict the only main (no main PDB, or minAvailable=0).
+  # Runtime check in the pod, not the spec: this catches the flag from any
+  # source (chart switch, extra env, valueFrom), not only a literal value.
+  # The command always exits 0 and prints a sentinel when the variable is
+  # unset, so a non-zero exit can only mean the exec itself failed (RBAC,
+  # pod not yet exec-able). `printenv` would exit 1 in both cases.
+  if [[ -n "$main_pod" ]]; then
+    if multi_main=$(kubectl exec "$main_pod" -n "$NAMESPACE" -c n8n-main \
+        -- sh -c 'printf "%s" "${N8N_MULTI_MAIN_SETUP_ENABLED-__unset__}"' 2>/dev/null); then
+      if [[ "$multi_main" == "true" ]]; then
+        fail "N8N_MULTI_MAIN_SETUP_ENABLED=true in the running main pod — multi-main must be off at 1 replica (check n8n_extra_env)"
+      elif [[ "$multi_main" == "__unset__" ]]; then
+        pass "Multi-main disabled in the running main pod (N8N_MULTI_MAIN_SETUP_ENABLED unset)"
+      else
+        pass "Multi-main disabled in the running main pod (N8N_MULTI_MAIN_SETUP_ENABLED='$multi_main')"
+      fi
+    else
+      warn "Could not exec into $main_pod to verify the multi-main flag at runtime (RBAC or pod not ready) — unverified, not unset"
+      info "Manually verify: kubectl exec -n $NAMESPACE $main_pod -c n8n-main -- printenv N8N_MULTI_MAIN_SETUP_ENABLED"
+    fi
+  else
+    warn "No running main pod found to verify the multi-main flag at runtime"
+  fi
+
+  main_hpa_min=$(kubectl get hpa n8n-main -n "$NAMESPACE" \
+    -o jsonpath='{.spec.minReplicas}' 2>/dev/null || echo "")
+  main_hpa_max=$(kubectl get hpa n8n-main -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxReplicas}' 2>/dev/null || echo "")
+  if [[ "$main_hpa_min" == "1" && "$main_hpa_max" == "1" ]]; then
+    pass "Main HPA pinned to min=1 max=1 — no second main without leader election"
+  else
+    fail "Main HPA is min=${main_hpa_min:-<unset>} max=${main_hpa_max:-<unset>} — expected 1/1; a second main without multi-main duplicates scheduled executions"
+  fi
+
+  main_strategy=$(kubectl get deployment n8n-main -n "$NAMESPACE" \
+    -o jsonpath='{.spec.strategy.type}' 2>/dev/null || echo "")
+  if [[ "$main_strategy" == "Recreate" ]]; then
+    pass "Main Deployment strategy is Recreate — no second main during rollouts"
+  else
+    fail "Main Deployment strategy is '${main_strategy:-<unset>}' — expected Recreate for single-main"
+  fi
+
+  # Chart 1.16.0 (n8n-io/n8n-hosting#228) renders no main PDB at all while main runs
+  # one replica; older charts still render the module's minAvailable=0
+  # budget. Both permit every voluntary eviction, so accept either shape.
+  # --ignore-not-found keeps a missing PDB (empty output, exit 0) apart from
+  # a failed lookup (non-zero exit), which must still fail loudly.
+  if pdb_lookup=$(kubectl get pdb n8n-main -n "$NAMESPACE" --ignore-not-found \
+      -o jsonpath='{.metadata.name}|{.spec.minAvailable}' 2>/dev/null); then
+    if [[ -z "$pdb_lookup" ]]; then
+      pass "Main has no PDB (chart 1.16.0+ skips a single-replica budget) — node drains can evict the only main"
+    else
+      pdb_min="${pdb_lookup#*|}"
+      pdb_allowed=$(kubectl get pdb n8n-main -n "$NAMESPACE" \
+        -o jsonpath='{.status.disruptionsAllowed}' 2>/dev/null || echo "")
+      if [[ "$pdb_min" == "0" ]]; then
+        pass "Main PDB minAvailable=0 (disruptionsAllowed=${pdb_allowed:-?}) — node drains can evict the only main"
+      else
+        fail "Main PDB minAvailable is '${pdb_min:-<unset>}' — expected no PDB (chart 1.16.0+) or minAvailable 0 for single-main"
+      fi
+    fi
+  else
+    fail "Main PDB lookup failed — expected no PDB (chart 1.16.0+) or minAvailable 0 for single-main"
+  fi
+
+elif [[ -n "$main_pod" ]]; then
+  # n8n uses Redis-based leader election. Verify the feature flag is enabled
+  # on main pods and that at least one pod reports leadership activity.
+  multi_main=$(kubectl exec "$main_pod" -n "$NAMESPACE" -c n8n-main \
+    -- printenv N8N_MULTI_MAIN_SETUP_ENABLED 2>/dev/null || echo "")
+  if [[ "$multi_main" == "true" ]]; then
+    pass "N8N_MULTI_MAIN_SETUP_ENABLED=true on main pods — Redis leader election active"
+  else
+    warn "N8N_MULTI_MAIN_SETUP_ENABLED is not 'true' (got: '${multi_main:-<unset>}')"
+    info "Expected when main replica count > 1"
+  fi
+
+  # Real line (n8n 2.x): "[Instance ID main-...] Leader is now this instance".
+  # Only the leader logs it, so scan every main pod, not just one.
+  # The line is logged once, on becoming leader, so a long-running leader
+  # may have rotated it out of --tail=300; that is why this only warns.
+  leader_log=""
+  for mp in $(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/component=main" \
+      -o name 2>/dev/null); do
+    mp_line=$(kubectl logs "$mp" -n "$NAMESPACE" -c n8n-main --tail=300 2>/dev/null \
+      | grep -F "Leader is now this instance" || true)
+    if [[ -n "$mp_line" ]]; then
+      leader_log+="${leader_log:+$'\n'}$mp_line"
+    fi
+  done
+  if [[ -n "$leader_log" ]]; then
+    pass "Leader election activity found in logs"
+    while IFS= read -r line; do info "$line"; done <<< "$leader_log"
+  else
+    warn "No pod logged 'Leader is now this instance' in the last 300 lines: no leader elected, or logs rotated"
+  fi
+else
+  warn "No running main pod found to check leader election"
+fi
+
+# ── Autoscaler configuration ──────────────────────────────────────────────────
+
+header "Autoscaler Configuration"
+
+check_hpa() {
+  local name="$1"
+  local label="$2"
+
+  if ! kubectl get hpa "$name" -n "$NAMESPACE" &>/dev/null; then
+    warn "HPA '$name' not found — HPAs are configured by Terraform, not manual deployment"
+    return
+  fi
+
+  local min max current targets
+  min=$(kubectl get hpa "$name" -n "$NAMESPACE" -o jsonpath='{.spec.minReplicas}')
+  max=$(kubectl get hpa "$name" -n "$NAMESPACE" -o jsonpath='{.spec.maxReplicas}')
+  current=$(kubectl get hpa "$name" -n "$NAMESPACE" -o jsonpath='{.status.currentReplicas}')
+  targets=$(kubectl get hpa "$name" -n "$NAMESPACE" \
+    -o jsonpath='{.status.currentMetrics[0].resource.current.averageUtilization}' 2>/dev/null || echo "unknown")
+
+  pass "$label HPA: min=$min max=$max current=$current CPU=$targets%"
+
+  # A fixed-size HPA (min == max) is always "at max"; that is configuration,
+  # not load. The module pins the main HPA to 1/1 in single-main mode.
+  if [[ "$min" -ne "$max" && "$current" -eq "$max" ]]; then
+    warn "$label is at max replicas ($max) — may indicate sustained high load"
+  fi
+}
+
+check_hpa "n8n-main"              "Main"
+check_hpa "n8n-webhook-processor" "Webhook processor"
+
+# Workers: prefer KEDA ScaledObject (queue-depth), fall back to CPU-based HPA
+if kubectl get scaledobject n8n-worker -n "$NAMESPACE" &>/dev/null 2>&1; then
+  min=$(kubectl get scaledobject n8n-worker -n "$NAMESPACE" \
+    -o jsonpath='{.spec.minReplicaCount}' 2>/dev/null || echo "?")
+  max=$(kubectl get scaledobject n8n-worker -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxReplicaCount}' 2>/dev/null || echo "?")
+  ready=$(kubectl get scaledobject n8n-worker -n "$NAMESPACE" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "?")
+  scaler_state=$(worker_scaler_state)
+  if worker_scaled_to_zero && [[ "$scaler_state" == not_ready ]]; then
+    fail "Worker KEDA ScaledObject: min=$min max=$max ready=$ready. Workers are at zero and the scaler is not Ready, so nothing will start a worker when jobs arrive"
+    info "Diagnose: kubectl describe scaledobject n8n-worker -n $NAMESPACE"
+  elif worker_scaled_to_zero && [[ "$scaler_state" == paused ]]; then
+    # A deliberate pause (n8n_worker_keda_pause) is an operator choice, not
+    # a broken scaler, so warn rather than fail. Jobs wait in Redis.
+    warn "Worker KEDA ScaledObject is paused with workers at zero: jobs wait in Redis until n8n_worker_keda_pause is cleared"
+  else
+    if [[ "$scaler_state" == not_ready && "$worker_unavailable" == true ]]; then
+      info "Worker KEDA ScaledObject not Ready (n8n-worker Deployment unavailable, reported above)"
+    elif [[ "$scaler_state" == not_ready ]]; then
+      fail "Worker KEDA ScaledObject: min=$min max=$max ready=$ready. KEDA cannot scale workers"
+      info "Diagnose: kubectl describe scaledobject n8n-worker -n $NAMESPACE"
+    else
+      pass "Worker KEDA ScaledObject: min=$min max=$max ready=$ready (queue-depth autoscaling)"
+    fi
+  fi
+elif kubectl get hpa n8n-worker -n "$NAMESPACE" &>/dev/null 2>&1; then
+  check_hpa "n8n-worker" "Worker"
+elif [[ "$worker_unavailable" == true ]]; then
+  skip "Worker autoscaler check (n8n-worker Deployment unavailable, reported above)"
+else
+  warn "No autoscaler found for n8n-worker — expected KEDA ScaledObject or CPU-based HPA"
+fi
+
+# ── Queue mode: Redis connectivity ────────────────────────────────────────────
+
+header "Queue Mode — Redis Connectivity"
+
+worker_pod=$(kubectl get pods -n "$NAMESPACE" \
+  -l "app.kubernetes.io/component=worker" \
+  --field-selector=status.phase=Running \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+if [[ -z "$worker_pod" ]] && worker_scaled_to_zero; then
+  skip "Redis connectivity from a worker pod (workers are scaled to zero)"
+  case "$(worker_scaler_state)" in
+    ready)
+      info "The Ready ScaledObject above already reads queue depth from Redis."
+      info "The workflow execution test below starts a worker from zero."
+      ;;
+    paused)
+      info "Unverified: the ScaledObject is paused, so no worker starts to probe from."
+      ;;
+    *)
+      info "Unverified: the ScaledObject is not Ready (see the failure above)."
+      ;;
+  esac
+elif [[ -z "$worker_pod" && "$worker_unavailable" == true ]]; then
+  skip "Redis connectivity probe (n8n-worker Deployment unavailable, reported above)"
+elif [[ -z "$worker_pod" ]]; then
+  fail "No running worker pod found to probe Redis connectivity"
+else
+  info "Using worker pod: $worker_pod"
+
+  redis_host=$(kubectl exec "$worker_pod" -n "$NAMESPACE" -c n8n-worker \
+    -- printenv QUEUE_BULL_REDIS_HOST 2>/dev/null || true)
+
+  if [[ -n "$redis_host" ]]; then
+    pass "Redis host visible in worker environment: $redis_host"
+  else
+    warn "Could not read Redis host from worker environment"
+    info "Manually verify: kubectl exec -n $NAMESPACE $worker_pod -c n8n-worker -- printenv | grep -i redis"
+  fi
+
+  if kubectl exec "$worker_pod" -n "$NAMESPACE" -c n8n-worker \
+      -- sh -c 'kill -0 1' &>/dev/null; then
+    queue_connected=$(kubectl logs "$worker_pod" -n "$NAMESPACE" -c n8n-worker --tail=100 2>/dev/null \
+      | grep -iE "queue|bull|redis|worker" | tail -3 || true)
+    if [[ -n "$queue_connected" ]]; then
+      pass "Worker logs show queue activity"
+      while IFS= read -r line; do info "$line"; done <<< "$queue_connected"
+    else
+      warn "No queue-related log lines found in last 100 worker log lines"
+    fi
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMMON CHECKS (Storage, HTTP, API, Workflow execution)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Cluster storage: EBS CSI + default StorageClass ───────────────────────────
+# Would have caught issue #22: a cluster with no CSI driver and no default
+# StorageClass leaves every unqualified PVC Pending forever.
+
+header "Cluster Storage"
+
+default_sc=$(kubectl get storageclass \
+  -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' \
+  2>/dev/null || echo "")
+
+if [[ "$default_sc" == "gp3" ]]; then
+  pass "Default StorageClass is gp3"
+elif [[ -n "$default_sc" ]]; then
+  warn "Default StorageClass is '$default_sc' (expected gp3)"
+else
+  fail "No default StorageClass, PVCs without storageClassName will stay Pending"
+fi
+
+gp3_provisioner=$(kubectl get storageclass gp3 \
+  -o jsonpath='{.provisioner}' 2>/dev/null || echo "")
+if [[ "$gp3_provisioner" == "ebs.csi.aws.com" ]]; then
+  pass "gp3 StorageClass uses the EBS CSI provisioner"
+else
+  fail "gp3 StorageClass provisioner is '${gp3_provisioner:-missing}' (expected ebs.csi.aws.com)"
+fi
+
+# grep -c (not -q): -q exits at the first match, kubectl takes a SIGPIPE on
+# the remaining lines, and pipefail turns that into a false failure.
+running_csi_pods=$(kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver \
+  --no-headers 2>/dev/null | grep -c "Running" || true)
+if [[ "${running_csi_pods:-0}" -gt 0 ]]; then
+  pass "EBS CSI driver pods are running in kube-system ($running_csi_pods pods)"
+else
+  fail "No running EBS CSI driver pods in kube-system"
+fi
+
+# ── Ingress routing ───────────────────────────────────────────────────────────
+# n8n runs here with disableProductionWebhooksOnMainProcess = true, which
+# disables five endpoint families on the main pods. Every one of them must be
+# routed to the webhook processors or it returns 404 in production: waiting
+# webhooks never resume, Form Trigger nodes break, MCP server triggers are
+# unreachable. Checking the Ingress object directly (rather than curling the
+# paths) keeps this deterministic: it needs no registered workflow, and it
+# distinguishes "wrong backend" from "no workflow with that path".
+
+header "Ingress Routing"
+
+WEBHOOK_PREFIXES=(/webhook /webhook-waiting /form /form-waiting /mcp)
+WEBHOOK_SVC="n8n-webhook-processor"
+
+ingress_paths=$(kubectl get ingress n8n-ingress -n "$NAMESPACE" \
+  -o jsonpath='{range .spec.rules[*].http.paths[*]}{.path}{"="}{.backend.service.name}{"\n"}{end}' \
+  2>/dev/null || true)
+
+if [[ -z "$ingress_paths" ]]; then
+  skip "Ingress routing (no 'n8n-ingress' in namespace '$NAMESPACE')"
+  info "Expected when create_ingress = false: you own the Ingresses."
+  info "Verify your own route all of: ${WEBHOOK_PREFIXES[*]} → $WEBHOOK_SVC"
+else
+  for prefix in "${WEBHOOK_PREFIXES[@]}"; do
+    # `|| true`: grep exits 1 on a missing route, which pipefail would turn
+    # into a silent abort before the FAIL line below could report it.
+    backend=$(echo "$ingress_paths" | grep -E "^${prefix}/?=" | head -1 | cut -d= -f2 || true)
+
+    if [[ -z "$backend" ]]; then
+      fail "$prefix is not routed, so requests fall through to the main pods and 404"
+    elif [[ "$backend" == "$WEBHOOK_SVC" ]]; then
+      pass "$prefix → $backend"
+    else
+      fail "$prefix → $backend (expected $WEBHOOK_SVC)"
+    fi
+  done
+
+  root_backend=$(echo "$ingress_paths" | grep -E '^/=' | head -1 | cut -d= -f2 || true)
+  if [[ "$root_backend" == "n8n-main" ]]; then
+    pass "/ → $root_backend"
+  elif [[ -n "$root_backend" ]]; then
+    fail "/ → $root_backend (expected n8n-main)"
+  else
+    warn "No catch-all '/' rule on the Ingress, so the editor UI may be unreachable"
+  fi
+fi
+
+# ── HTTP health check ─────────────────────────────────────────────────────────
+
+header "HTTP Health Check"
+
+if [[ -z "$N8N_URL" ]]; then
+  skip "HTTP health check (N8N_URL not set)"
+else
+  # curl writes 000 to stdout on a connection failure and also exits non-zero.
+  # A `|| echo "000"` here would append a second 000, producing "000000" and
+  # making the "000" branch below unreachable, so swallow the exit code instead.
+  healthz_status=$(curl -sk -o /dev/null -w "%{http_code}" \
+    --max-time 10 "${N8N_URL%/}/healthz") || true
+  [[ -z "$healthz_status" ]] && healthz_status="000"
+
+  if [[ "$healthz_status" == "200" ]]; then
+    pass "/healthz returned HTTP $healthz_status"
+  elif [[ "$healthz_status" == "000" ]]; then
+    # An unreachable host is the expected result, not a failure, when the admin
+    # Ingress is internal: examples/split-ingress puts the editor on an
+    # internal-scheme ALB, and the module does the same with
+    # ingress_scheme = "internal". Both resolve to RFC1918 addresses that no
+    # host outside the VPC or VPN can reach. Distinguish the two cases by what
+    # the name resolves to, so a genuine outage still fails loudly.
+    n8n_host="${N8N_URL#*://}"; n8n_host="${n8n_host%%/*}"
+    # `|| true`: under `set -euo pipefail`, grep exits 1 when the name does not
+    # resolve, which is itself one of the cases this branch exists to report
+    # (an internal ALB whose record has not propagated to the runner). Without
+    # the guard the pipeline aborts the whole script before the summary prints.
+    resolved=$(dig +short "$n8n_host" A 2>/dev/null | grep -E '^[0-9]+\.' | head -1 || true)
+
+    if [[ "$resolved" =~ ^10\. || "$resolved" =~ ^192\.168\. || "$resolved" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]]; then
+      skip "/healthz — $n8n_host resolves to $resolved (private), so it is unreachable from here by design"
+      info "This is expected for an internal admin Ingress, e.g. examples/split-ingress"
+      info "or ingress_scheme = \"internal\". Re-run from inside the VPC or over the VPN,"
+      info "or check it in-cluster:"
+      info "  kubectl run smoke --rm -i --restart=Never -n $NAMESPACE --image=curlimages/curl:8.5.0 \\"
+      info "    -- curl -sk --resolve $n8n_host:443:$resolved https://$n8n_host/healthz"
+    else
+      fail "/healthz — connection failed (timeout or DNS error)"
+      if [[ "$(uname -s)" == "Darwin" ]]; then
+        info "On macOS, a recent destroy + re-apply against the same FQDN often"
+        info "leaves mDNSResponder serving the destroy-phase NXDOMAIN for 5-15 min."
+        info "Fix: sudo killall -HUP mDNSResponder"
+        info "Details: docs/troubleshooting.md → 'Smoke test reports HTTP 000'"
+      fi
+    fi
+  else
+    fail "/healthz returned HTTP $healthz_status (expected 200)"
+  fi
+
+  # Verify HTTP → HTTPS redirect
+  http_url="${N8N_URL/https:/http:}"
+  if [[ "$http_url" != "$N8N_URL" ]]; then
+    # Same trailing-|| trap as the healthz check above: curl already emits 000.
+    redirect_status=$(curl -sk -o /dev/null -w "%{http_code}" \
+      --max-time 10 "$http_url") || true
+    [[ -z "$redirect_status" ]] && redirect_status="000"
+    if [[ "$redirect_status" =~ ^30[1-8]$ ]]; then
+      pass "HTTP → HTTPS redirect: $redirect_status"
+    elif [[ "$redirect_status" == "000" ]]; then
+      warn "HTTP redirect check — connection failed"
+    else
+      warn "HTTP → HTTPS redirect returned $redirect_status (expected 301/302/307/308)"
+    fi
+  fi
+fi
+
+# ── API connectivity ──────────────────────────────────────────────────────────
+
+header "API Connectivity"
+
+if [[ -z "$N8N_URL" || -z "$N8N_API_KEY" ]]; then
+  skip "API connectivity test (requires N8N_URL and N8N_API_KEY)"
+else
+  api_status=$(curl -sk -o /dev/null -w "%{http_code}" \
+    --max-time 10 \
+    -H "X-N8N-API-KEY: $N8N_API_KEY" \
+    "${N8N_URL%/}/api/v1/workflows?limit=1" || echo "000")
+
+  if [[ "$api_status" == "200" ]]; then
+    pass "API /api/v1/workflows responded HTTP $api_status"
+  elif [[ "$api_status" == "401" ]]; then
+    fail "API returned 401 Unauthorized — check your N8N_API_KEY"
+  elif [[ "$api_status" == "000" ]]; then
+    fail "API — connection failed (timeout or DNS error)"
+  else
+    fail "API /api/v1/workflows returned HTTP $api_status"
+  fi
+fi
+
+# ── Workflow execution ────────────────────────────────────────────────────────
+#
+# Webhook → Set, plus a JS Code node when the worker runner sidecar exists
+# and a Python Code node when taskRunners.nativePythonRunner is set. Code
+# nodes run on workers in queue mode, so this is the end-to-end runner check;
+# the sidecar check above only confirms the runner container and its logs.
+
+header "Workflow Execution via Queue"
+
+# With workers at zero and a scaler that cannot start one (not Ready, or
+# paused on purpose), a queued execution can only time out. The Autoscaler
+# section already reported which, so skip rather than spend the full poll
+# budget on a warning that reads like a slow execution.
+exec_blocked_reason=""
+if worker_scaled_to_zero; then
+  case "$(worker_scaler_state)" in
+    paused)    exec_blocked_reason="workers are at zero and the worker ScaledObject is paused" ;;
+    not_ready) exec_blocked_reason="workers are at zero and the worker ScaledObject is not Ready" ;;
+  esac
+fi
+
+smoke_js_runner=false
+smoke_py_runner=false
+if kubectl get deployment n8n-worker -n "$NAMESPACE" \
+     -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null | grep -qi runner; then
+  smoke_js_runner=true
+  # nativePythonRunner lives only in chart values; needs helm.
+  if ! command -v helm &>/dev/null; then
+    info "helm not found: cannot read taskRunners.nativePythonRunner, Python runner not exercised"
+  elif ! helm_values=$(helm get values n8n -n "$NAMESPACE" -a -o json 2>/dev/null); then
+    info "helm get values n8n failed: cannot read taskRunners.nativePythonRunner, Python runner not exercised"
+  elif [[ "$(python3 -c "import sys,json; print(str(json.load(sys.stdin).get('taskRunners',{}).get('nativePythonRunner',False)).lower())" <<<"$helm_values" 2>/dev/null)" == true ]]; then
+    smoke_py_runner=true
+  fi
+fi
+
+if [[ -z "$N8N_URL" || -z "$N8N_API_KEY" ]]; then
+  skip "Workflow execution test (requires N8N_URL and N8N_API_KEY)"
+elif [[ "$worker_unavailable" == true ]]; then
+  skip "Workflow execution test (n8n-worker Deployment unavailable, reported above)"
+elif [[ -n "$exec_blocked_reason" ]]; then
+  skip "Workflow execution test ($exec_blocked_reason, so no worker can start)"
+else
+  webhook_path="smoke-test-$$"
+
+  # Webhook → Set, plus JS/Python Code nodes when the matching task runner
+  # is enabled on the workers (Code nodes run on workers in queue mode, so
+  # this is the only end-to-end runner check).
+  workflow_payload=$(WEBHOOK_PATH="$webhook_path" RUN_JS="$smoke_js_runner" RUN_PY="$smoke_py_runner" python3 - <<'PYEOF'
+import json, os
+p = os.environ["WEBHOOK_PATH"]
+nodes = [
+    {"id": "a1b2c3d4-0001-0001-0001-000000000001", "name": "Webhook",
+     "type": "n8n-nodes-base.webhook", "typeVersion": 1, "position": [250, 300],
+     "webhookId": p,
+     "parameters": {"httpMethod": "POST", "path": p, "responseMode": "onReceived"}},
+    {"id": "a1b2c3d4-0002-0002-0002-000000000002", "name": "Set",
+     "type": "n8n-nodes-base.set", "typeVersion": 3.4, "position": [450, 300],
+     "parameters": {"assignments": {"assignments": [
+         {"id": "1", "name": "smoke_test", "value": "passed", "type": "string"}]}}},
+]
+chain = ["Set"]
+if os.environ["RUN_JS"] == "true":
+    nodes.append({"id": "a1b2c3d4-0003-0003-0003-000000000003", "name": "JS Code",
+        "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [650, 300],
+        "parameters": {"jsCode": "return [{ json: { js_runner: 'passed' } }];"}})
+    chain.append("JS Code")
+if os.environ["RUN_PY"] == "true":
+    # language "python" runs on the native Python runner on n8n 2.x
+    # (Pyodide was removed in 2.0). Verified live on n8n 2.40.5, the
+    # chart 1.13.0 default.
+    nodes.append({"id": "a1b2c3d4-0004-0004-0004-000000000004", "name": "Python Code",
+        "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [850, 300],
+        "parameters": {"language": "python",
+                       "pythonCode": "return [{'json': {'python_runner': 'passed'}}]"}})
+    chain.append("Python Code")
+conns = {"Webhook": {"main": [[{"node": "Set", "type": "main", "index": 0}]]}}
+for a, b in zip(chain, chain[1:]):
+    conns[a] = {"main": [[{"node": b, "type": "main", "index": 0}]]}
+print(json.dumps({"name": "__smoke-test__", "nodes": nodes, "connections": conns, "settings": {}}))
+PYEOF
+)
+  exec_success_msg="Execution completed successfully, queue mode is working"
+  [[ "$smoke_js_runner" == true ]] && exec_success_msg="$exec_success_msg (JS runner exercised)"
+  [[ "$smoke_py_runner" == true ]] && exec_success_msg="$exec_success_msg (Python runner exercised)"
+
+  # Create workflow
+  create_response=$(curl -sk -w "\n%{http_code}" \
+    --max-time 15 \
+    -X POST \
+    -H "X-N8N-API-KEY: $N8N_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$workflow_payload" \
+    "${N8N_URL%/}/api/v1/workflows" 2>/dev/null || echo -e "\n000")
+
+  create_status=$(echo "$create_response" | tail -1)
+  create_body=$(echo "$create_response" | sed '$d')
+
+  if [[ "$create_status" != "200" ]]; then
+    fail "Failed to create test workflow (HTTP $create_status)"
+    info "Response: $create_body"
+    info "Skipping execution test"
+  else
+    workflow_id=$(echo "$create_body" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "")
+    pass "Test workflow created (id: $workflow_id)"
+
+    # Activate so the webhook listener starts
+    activate_status=$(curl -sk -o /dev/null -w "%{http_code}" \
+      --max-time 10 \
+      -X POST \
+      -H "X-N8N-API-KEY: $N8N_API_KEY" \
+      "${N8N_URL%/}/api/v1/workflows/${workflow_id}/activate" 2>/dev/null || echo "000")
+
+    if [[ "$activate_status" != "200" ]]; then
+      fail "Failed to activate test workflow (HTTP $activate_status)"
+    else
+      pass "Test workflow activated"
+
+      info "Waiting 5s for webhook-processor to register the new webhook..."
+      sleep 5
+      # Captured before the webhook fires: once the job is queued, KEDA may
+      # already have moved the Deployment 0 -> 1 by the time the poll
+      # budget is chosen, and that worker still has a cold start ahead.
+      worker_was_zero=false
+      worker_scaled_to_zero && worker_was_zero=true
+      info "Triggering execution via webhook — will be queued to a worker"
+
+      trigger_status=$(curl -sk -o /dev/null -w "%{http_code}" \
+        --max-time 15 \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"smoke_test": true}' \
+        "${N8N_URL%/}/webhook/${webhook_path}" 2>/dev/null || echo "000")
+
+      if [[ "$trigger_status" =~ ^2 ]]; then
+        pass "Webhook triggered (HTTP $trigger_status)"
+
+        info "Waiting for execution to complete..."
+        exec_state="unreadable"
+        # 30 x 2s = 60s. A freshly booted worker's first job pays a one-time
+        # cold-start cost connecting to Redis/the broker; observed taking
+        # ~30-40s on a brand-new cluster even though the job itself is
+        # trivial, so the old 15 x 2s = 30s budget produced a false warning
+        # on an execution that in fact went on to succeed seconds later.
+        # Workers scaled to zero add KEDA's polling interval, pod scheduling
+        # (possibly a new node) and pod startup on top, so allow 180s there.
+        exec_polls=30
+        [[ "${worker_was_zero:-false}" == true ]] && exec_polls=90
+        [[ "$exec_polls" -gt 30 ]] && info "Workers are scaled to zero: waiting up to $((exec_polls * 2))s for KEDA to start one"
+        # 'no_record' only for a well-formed response with an empty 'data'
+        # list. An error body (401/403/5xx JSON without 'data') or a failed
+        # request is 'unreadable', so an API error cannot pass as "no record".
+        # 'unreadable' is not an n8n status; 'unknown' is one (n8n
+        # packages/workflow/src/execution-status.ts), so it is not reused as
+        # the sentinel. exec_last keeps the last status the API returned, so
+        # one failed read on the final poll does not hide it.
+        exec_last=""
+        for i in $(seq 1 "$exec_polls"); do
+          sleep 2
+          exec_state=$(curl -sk \
+            --max-time 10 \
+            -H "X-N8N-API-KEY: $N8N_API_KEY" \
+            "${N8N_URL%/}/api/v1/executions?workflowId=${workflow_id}&limit=1" 2>/dev/null \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); e=d.get('data') if isinstance(d,dict) else None; sys.exit(1) if not isinstance(e,list) else print(e[0]['status'] if e else 'no_record')" 2>/dev/null \
+            || echo "unreadable")
+          [[ "$exec_state" != "unreadable" ]] && exec_last="$exec_state"
+
+          if [[ "$exec_state" == "success" ]]; then
+            pass "$exec_success_msg"
+            break
+          elif [[ "$exec_state" == "error" || "$exec_state" == "crashed" ]]; then
+            fail "Execution ended with status: $exec_state"
+            break
+          elif [[ "$i" -eq "$exec_polls" ]]; then
+            exec_state="${exec_last:-unreadable}"
+            if [[ "$exec_state" == "new" ]]; then
+              # Never picked up: nothing consumed the queued job. A slow
+              # run would be 'running' by now.
+              fail "Execution never left state 'new' after $((exec_polls * 2))s: no worker picked it up"
+              info "Check: kubectl get pods -n $NAMESPACE -l app.kubernetes.io/component=worker; kubectl logs -n $NAMESPACE -l app.kubernetes.io/component=worker --tail=50"
+            elif [[ "$exec_state" == "waiting" ]]; then
+              # 'waiting' is a suspended run (normally a Wait node). This
+              # workflow has none, so it cannot finish from here.
+              fail "Execution suspended in state 'waiting' after $((exec_polls * 2))s, but the test workflow has no Wait node"
+              info "Check: kubectl logs -n $NAMESPACE -l app.kubernetes.io/component=worker --tail=50"
+            elif [[ "$exec_state" == "no_record" ]]; then
+              # An empty list proves neither failure nor success: with
+              # n8n_executions_data_save_on_success = "none", n8n deletes
+              # the record of a successful run, and the list may also omit
+              # an execution that is still running.
+              warn "No execution record returned for the test workflow after $((exec_polls * 2))s: outcome unverified (not created, still running, or deleted by n8n_executions_data_save_on_success = \"none\")"
+              info "Check: kubectl logs -n $NAMESPACE -l app.kubernetes.io/component=worker --tail=50"
+            elif [[ "$exec_state" == "unknown" ]]; then
+              # A real n8n status: indeterminate, typically an execution
+              # interrupted by a restart. Recovery may later mark it crashed.
+              warn "Execution in indeterminate state 'unknown' after $((exec_polls * 2))s: likely interrupted (worker or main restart); n8n recovery may mark it crashed"
+              info "Check restarts: kubectl get pods -n $NAMESPACE; kubectl logs -n $NAMESPACE -l app.kubernetes.io/component=worker --tail=50"
+            elif [[ "$exec_state" == "unreadable" ]]; then
+              fail "Could not read execution status from ${N8N_URL%/}/api/v1/executions in $((exec_polls * 2))s (request failed or error response)"
+              info "Check: curl -sk -H 'X-N8N-API-KEY: ...' '${N8N_URL%/}/api/v1/executions?workflowId=${workflow_id}&limit=1'"
+            else
+              warn "Execution still in state '$exec_state' after $((exec_polls * 2))s"
+              info "May be slow to process, check: kubectl logs -n $NAMESPACE -l app.kubernetes.io/component=worker --tail=50"
+            fi
+          fi
+        done
+      else
+        fail "Webhook trigger failed (HTTP $trigger_status)"
+        info "Webhook URL: ${N8N_URL%/}/webhook/${webhook_path}"
+      fi
+    fi
+
+    # Cleanup — deactivate then delete
+    curl -sk -o /dev/null --max-time 10 -X POST \
+      -H "X-N8N-API-KEY: $N8N_API_KEY" \
+      "${N8N_URL%/}/api/v1/workflows/${workflow_id}/deactivate" 2>/dev/null || true
+    curl -sk -o /dev/null --max-time 10 -X DELETE \
+      -H "X-N8N-API-KEY: $N8N_API_KEY" \
+      "${N8N_URL%/}/api/v1/workflows/${workflow_id}" 2>/dev/null || true
+    info "Test workflow deleted"
+  fi
+fi
+
+# ── Worker scaling test (optional) ────────────────────────────────────────────
+#
+# Creates a temporary CPU-burning workflow, queues LOAD_REQUESTS concurrent
+# executions, and verifies that the worker HPA/KEDA scales up.
+#
+# Why not /healthz? Those requests never touch worker pods — they hit the main
+# pods' HTTP listener. Workers only get CPU when executing workflows.
+
+header "Worker Scaling Test"
+
+if [[ "$LOAD_TEST" != "true" ]]; then
+  skip "Load scaling test (set LOAD_TEST=true to enable)"
+elif [[ -z "$N8N_URL" || -z "$N8N_API_KEY" ]]; then
+  skip "Load scaling test (requires N8N_URL and N8N_API_KEY)"
+else
+  SCALER_MODE=""
+  if kubectl get hpa n8n-worker -n "$NAMESPACE" &>/dev/null; then
+    worker_hpa_targets=$(kubectl get hpa n8n-worker -n "$NAMESPACE" \
+      --no-headers 2>/dev/null | awk '{print $3}' || echo "<unknown>")
+    if [[ "$worker_hpa_targets" == *"<unknown>"* ]]; then
+      warn "HPA CPU metrics are <unknown> — metrics-server is not installed or not yet ready"
+      info "Install metrics-server if not already done, then wait ~2 minutes for metrics to populate."
+      info "Verify: kubectl top pods -n $NAMESPACE"
+      info "Skipping load test — it cannot demonstrate scaling in this state."
+    else
+      SCALER_MODE="hpa"
+    fi
+  elif kubectl get scaledobject n8n-worker -n "$NAMESPACE" &>/dev/null; then
+    info "No HPA found — KEDA ScaledObject detected. Scaling is queue-depth driven (Redis)."
+    SCALER_MODE="keda"
+  else
+    skip "Load scaling test — no HPA or KEDA ScaledObject found for n8n-worker"
+  fi
+
+  if [[ -n "$SCALER_MODE" ]]; then
+    load_webhook_path="smoke-load-$$"
+    load_duration_ms=$((LOAD_JOB_DURATION_SECS * 1000))
+    load_js="const end = Date.now() + ${load_duration_ms}; let x = 0; while (Date.now() < end) { for (let i = 0; i < 100000; i++) x += Math.sqrt(i); } return [{json: {done: true, elapsed: Date.now() - (end - ${load_duration_ms})}}];"
+
+    load_workflow_payload=$(cat <<EOF
+{
+  "name": "__smoke-load-test__",
+  "nodes": [
+    {
+      "id": "a1b2c3d4-0011-0011-0011-000000000011",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "${load_webhook_path}",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "${load_webhook_path}",
+        "responseMode": "onReceived"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0012-0012-0012-000000000012",
+      "name": "CPU Burn",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300],
+      "parameters": {
+        "jsCode": "${load_js}"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "CPU Burn", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {}
+}
+EOF
+    )
+
+    load_workflow_id=""
+
+    load_create_response=$(curl -sk -w "\n%{http_code}" \
+      --max-time 15 \
+      -X POST \
+      -H "X-N8N-API-KEY: $N8N_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d "$load_workflow_payload" \
+      "${N8N_URL%/}/api/v1/workflows" 2>/dev/null || echo -e "\n000")
+
+    load_create_status=$(echo "$load_create_response" | tail -1)
+    load_create_body=$(echo "$load_create_response" | sed '$d')
+
+    if [[ "$load_create_status" != "200" ]]; then
+      warn "Could not create load test workflow (HTTP $load_create_status) — skipping scaling test"
+      info "Response: $load_create_body"
+    else
+      load_workflow_id=$(echo "$load_create_body" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "")
+      info "Load test workflow created (id: $load_workflow_id, CPU burn: ${LOAD_JOB_DURATION_SECS}s per job)"
+
+      load_activate_status=$(curl -sk -o /dev/null -w "%{http_code}" \
+        --max-time 10 \
+        -X POST \
+        -H "X-N8N-API-KEY: $N8N_API_KEY" \
+        "${N8N_URL%/}/api/v1/workflows/${load_workflow_id}/activate" 2>/dev/null || echo "000")
+
+      if [[ "$load_activate_status" != "200" ]]; then
+        warn "Could not activate load test workflow (HTTP $load_activate_status) — skipping scaling test"
+      else
+        if [[ "$SCALER_MODE" == "hpa" ]]; then
+          worker_before=$(kubectl get hpa n8n-worker -n "$NAMESPACE" \
+            -o jsonpath='{.status.currentReplicas}' 2>/dev/null || echo "0")
+        else
+          worker_before=$(kubectl get deployment n8n-worker -n "$NAMESPACE" \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          worker_before="${worker_before:-0}"
+        fi
+        info "Baseline — worker: $worker_before replica(s)"
+
+        # Clamp seed batch to total request count
+        load_seed=$LOAD_SEED_JOBS
+        [[ $load_seed -gt $LOAD_REQUESTS ]] && load_seed=$LOAD_REQUESTS
+        load_remaining=$((LOAD_REQUESTS - load_seed))
+
+        # Phase 1: queue seed jobs to signal the autoscaler
+        if [[ "$SCALER_MODE" == "keda" ]]; then
+          info "Phase 1: queuing $load_seed seed jobs to build queue depth (KEDA trigger)..."
+        else
+          info "Phase 1: queuing $load_seed seed jobs — each burns ~${LOAD_JOB_DURATION_SECS}s CPU (HPA trigger)..."
+        fi
+
+        for i in $(seq 1 "$load_seed"); do
+          curl -sk -o /dev/null --max-time 10 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"job\": $i}" \
+            "${N8N_URL%/}/webhook/${load_webhook_path}" &
+          if (( i % LOAD_CONCURRENCY == 0 )); then wait || true; fi
+        done
+        wait || true
+        info "$load_seed seed jobs queued. Polling for scale-up (max ${SCALE_WAIT_SECS}s)..."
+
+        # Poll for scale-up
+        worker_scaled=false
+        worker_after="$worker_before"
+        elapsed=0
+        poll_interval=15
+        while [[ $elapsed -lt $SCALE_WAIT_SECS ]]; do
+          sleep $poll_interval
+          elapsed=$((elapsed + poll_interval))
+          if [[ "$SCALER_MODE" == "hpa" ]]; then
+            worker_now=$(kubectl get hpa n8n-worker -n "$NAMESPACE" \
+              -o jsonpath='{.status.currentReplicas}' 2>/dev/null || echo "0")
+          else
+            worker_now=$(kubectl get deployment n8n-worker -n "$NAMESPACE" \
+              -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            worker_now="${worker_now:-0}"
+          fi
+          if [[ "$worker_now" -gt "$worker_before" ]]; then
+            worker_scaled=true
+            worker_after="$worker_now"
+            break
+          fi
+          info "  ${elapsed}s / ${SCALE_WAIT_SECS}s — worker replicas: ${worker_now} (waiting for > $worker_before)"
+        done
+
+        if [[ "$worker_scaled" == "true" ]]; then
+          pass "Worker pods scaled: $worker_before → $worker_after (detected after ${elapsed}s)"
+
+          # Phase 2: queue remaining jobs so the new workers are visibly utilized
+          if [[ $load_remaining -gt 0 ]]; then
+            info "Phase 2: queuing $load_remaining remaining jobs across $worker_after worker(s)..."
+            info "Watch new workers pick up jobs: kubectl get pods -n $NAMESPACE -l app.kubernetes.io/component=worker -w"
+            for i in $(seq $((load_seed + 1)) "$LOAD_REQUESTS"); do
+              curl -sk -o /dev/null --max-time 10 \
+                -X POST \
+                -H "Content-Type: application/json" \
+                -d "{\"job\": $i}" \
+                "${N8N_URL%/}/webhook/${load_webhook_path}" &
+              if (( (i - load_seed) % LOAD_CONCURRENCY == 0 )); then wait || true; fi
+            done
+            wait || true
+            info "All $LOAD_REQUESTS jobs queued total — $load_seed seed + $load_remaining follow-on"
+          fi
+        else
+          warn "Worker pods did not scale ($worker_before → $worker_after) within ${SCALE_WAIT_SECS}s"
+          if [[ "$SCALER_MODE" == "keda" ]]; then
+            info "Diagnose: kubectl describe scaledobject n8n-worker -n $NAMESPACE"
+            info "Check queue depth: kubectl exec -n $NAMESPACE \$(kubectl get pod -n $NAMESPACE -l app.kubernetes.io/name=redis -o name | head -1) -- redis-cli llen bull:jobs:wait"
+          else
+            info "Diagnose: kubectl describe hpa n8n-worker -n $NAMESPACE"
+          fi
+          info "Try: LOAD_REQUESTS=100 LOAD_JOB_DURATION_SECS=10 LOAD_TEST=true ./smoke-test.sh"
+        fi
+
+        if [[ "$SCALER_MODE" == "hpa" ]]; then
+          info "Current HPA state:"
+          kubectl get hpa -n "$NAMESPACE" 2>/dev/null | while IFS= read -r line; do info "$line"; done
+        else
+          info "Current KEDA ScaledObject state:"
+          kubectl get scaledobject -n "$NAMESPACE" 2>/dev/null | while IFS= read -r line; do info "$line"; done
+        fi
+      fi
+
+      if [[ -n "$load_workflow_id" ]]; then
+        curl -sk -o /dev/null --max-time 10 -X POST \
+          -H "X-N8N-API-KEY: $N8N_API_KEY" \
+          "${N8N_URL%/}/api/v1/workflows/${load_workflow_id}/deactivate" 2>/dev/null || true
+        curl -sk -o /dev/null --max-time 10 -X DELETE \
+          -H "X-N8N-API-KEY: $N8N_API_KEY" \
+          "${N8N_URL%/}/api/v1/workflows/${load_workflow_id}" 2>/dev/null || true
+        info "Load test workflow deleted"
+      fi
+    fi
+  fi
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+echo ""
+echo -e "${BOLD}══════════════════════════════════════${RESET}"
+echo -e "${BOLD}  Smoke Test Summary${RESET}"
+echo -e "${BOLD}══════════════════════════════════════${RESET}"
+echo -e "  ${GREEN}Passed:${RESET}  $PASS"
+echo -e "  ${RED}Failed:${RESET}  $FAIL"
+echo -e "  ${YELLOW}Warnings:${RESET} $WARN"
+echo -e "  ${YELLOW}Skipped:${RESET} $SKIPPED"
+echo ""
+
+if [[ "$FAIL" -gt 0 ]]; then
+  echo -e "${RED}${BOLD}RESULT: FAIL — $FAIL check(s) did not pass.${RESET}"
+  exit 1
+else
+  echo -e "${GREEN}${BOLD}RESULT: PASS${RESET}"
+  exit 0
+fi

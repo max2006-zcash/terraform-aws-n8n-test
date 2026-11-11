@@ -1,0 +1,284 @@
+locals {
+  aws_partner_attribution_tags = {
+    for k, v in { "aws-apn-id" = var.aws_partner_attribution_tag } : k => v if v != ""
+  }
+
+  common_tags = merge(
+    {
+      ManagedBy = "terraform"
+      Project   = "n8n"
+    },
+    # aws-apn-id is reserved for aws_partner_attribution_tag, so a tags entry
+    # cannot override it or bring it back after the input is set to "".
+    { for k, v in var.tags : k => v if k != "aws-apn-id" },
+    local.aws_partner_attribution_tags,
+  )
+}
+
+# ── VPC ───────────────────────────────────────────────────────────────────────
+# /20 private subnets are mandatory at this node count. m7i.4xlarge has 8 ENIs
+# × 30 IPs each. With WARM_ENI_TARGET=1 (default), 25 nodes pre-warm
+# 25 × 8 × 30 = 6,000 IPs — exhausting two /24s (508 usable IPs total) before
+# any pod is scheduled. Two /20s give 8,188 usable IPs with ample headroom.
+#
+# The VPC CNI addon (below) locks WARM_ENI_TARGET=0 so warm pools consume only
+# 2 IPs per node instead of a full ENI worth. Without this, even /20s can
+# exhaust under rolling upgrades when old + new nodes overlap.
+#
+# Two NAT Gateways (one per AZ) prevent a single NAT from becoming an HA
+# bottleneck at this traffic volume.
+
+data "aws_availability_zones" "available" {
+  # checkov:skip=CKV_AWS_394:Region-portable example intentionally discovers AZs instead of hardcoding region-specific zone identities; see docs/versioning.md for the accepted replacement risk.
+  # slice(..., 0, 2) bounds the count, not the zone identities. A changed list
+  # can replace subnets. Pin the existing zones in long-lived deployments and
+  # review the plan before applying.
+  state = "available"
+}
+
+module "vpc" {
+  # checkov:skip=CKV_TF_1:A commit hash cannot be expressed for a Terraform Registry source: this address takes a `version` constraint, and pinning a SHA would mean switching to a `git::` source, which is the weaker supply-chain posture the check exists to discourage. Registry releases are immutable per published version. Annotated per call rather than suppressed repo-wide, so the check still fires if a genuinely mutable git:: source is ever added.
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = "${var.cluster_name}-vpc"
+  cidr = "10.0.0.0/16"
+
+  azs             = slice(data.aws_availability_zones.available.names, 0, 2)
+  public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
+  private_subnets = ["10.0.64.0/20", "10.0.80.0/20"]
+
+  enable_nat_gateway     = true
+  single_nat_gateway     = false
+  one_nat_gateway_per_az = true
+  enable_dns_hostnames   = true
+  enable_dns_support     = true
+
+  public_subnet_tags = {
+    "kubernetes.io/role/elb"                    = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+  }
+
+  private_subnet_tags = {
+    "kubernetes.io/role/internal-elb"           = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+  }
+
+  tags = local.common_tags
+}
+
+# ── n8n ───────────────────────────────────────────────────────────────────────
+
+module "n8n" {
+  source = "../.."
+
+  aws_partner_attribution_tag = var.aws_partner_attribution_tag
+
+  aws_region      = var.aws_region
+  cluster_name    = var.cluster_name
+  n8n_domain      = var.n8n_domain
+  vpc_id          = module.vpc.vpc_id
+  private_subnets = module.vpc.private_subnets
+  public_subnets  = module.vpc.public_subnets
+  vpc_cidr_block  = module.vpc.vpc_cidr_block
+  route53_zone_id = var.route53_zone_id
+  certificate_arn = var.certificate_arn
+
+  n8n_license_key                  = var.n8n_license_key
+  n8n_image_repository             = var.n8n_image_repository
+  n8n_image_tag                    = var.n8n_image_tag
+  n8n_task_runner_image_tag        = var.n8n_task_runner_image_tag
+  n8n_task_runner_image_repository = var.n8n_task_runner_image_repository
+  n8n_custom_extensions_path       = var.n8n_custom_extensions_path
+  n8n_image_pull_secrets           = var.n8n_image_pull_secrets
+
+  # ── Execution data ────────────────────────────────────────────────────────────
+  # Left at "database" so this example works on any license. At this tier's
+  # volume, execution-data writes are usually the dominant write load on the
+  # database, so "s3" is the first lever to reach for when Aurora is the
+  # bottleneck. It reuses the bucket and Pod Identity role the module already
+  # creates for binary data, so nothing else changes. Read the execution data
+  # section of the root README first: it needs n8n >= 2.27 and an Enterprise
+  # license, it does not backfill, and it changes the durability posture of
+  # execution history.
+  n8n_execution_data_storage_mode = var.n8n_execution_data_storage_mode
+
+  # ── External database (Aurora) via PgBouncer ──────────────────────────────────
+  # Aurora is created in aurora.tf, PgBouncer in pgbouncer.tf. n8n connects to
+  # the PgBouncer ClusterIP service in the `pgbouncer` namespace; PgBouncer
+  # terminates SSL on its upstream leg to Aurora.
+  #
+  # create_database = false tells the module to skip creating its own RDS
+  # instance and use db_host / db_password instead. The flag is a static
+  # boolean so the module's `count` expressions resolve at plan time —
+  # `db_host` itself is computed (known after apply) and can't gate count.
+  #
+  # db_postgresdb_ssl_enabled = false because PgBouncer<->Aurora handles SSL;
+  # the n8n -> PgBouncer leg is plain TCP within the cluster. That also makes
+  # db_postgresdb_ssl_reject_unauthorized / db_postgresdb_ssl_ca_pem inert
+  # here: this module only ever sees db_host (PgBouncer's in-cluster Service),
+  # so it has no visibility into or control over PgBouncer's own upstream TLS
+  # posture to Aurora (SERVER_TLS_SSLMODE=require in pgbouncer.tf, encryption
+  # only, no certificate verification). See docs/postgresql-tls.md.
+  create_database           = false
+  db_host                   = "${kubernetes_service.pgbouncer.metadata[0].name}.${kubernetes_namespace.pgbouncer.metadata[0].name}.svc.cluster.local"
+  db_password               = random_password.aurora.result
+  db_postgresdb_ssl_enabled = false
+
+  # ── Compute ───────────────────────────────────────────────────────────────────
+  # m7i.4xlarge: 16 vCPU, 64 GB. Intel x86_64 — required with AL2023_x86_64_STANDARD
+  # AMI type. Graviton (m7g.*) requires AL2023_ARM_64_STANDARD.
+  # Floor of 10 keeps scheduling warm; 50 max covers 2,400 req/s peak.
+  node_instance_type = "m7i.4xlarge"
+  node_desired       = 10
+  node_min           = 10
+  node_max           = 50
+
+  # 100 GiB volumes: the module's default disk filled fleet-wide under n8n's
+  # image plus execution-data churn and evicted every pod on the node group
+  # (the incident behind the node_disk_size variable itself). This tier is
+  # the deployment class that eviction happened on.
+  node_disk_size = 100
+
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  # Measured hard ceiling: the no-op webhook workload capped at 869 req/s on
+  # cache.r6g.large and reached 897-906 req/s on cache.r6g.2xlarge with no
+  # other change (round-2 T-B/T-C passes, 2026-08-24). Redis backs the Bull
+  # queue, so every execution crosses it; at this tier's throughput target
+  # the large node IS the bottleneck. If you downsize, 869 req/s is the
+  # measured trigger for moving back up.
+  redis_node_type = "cache.r6g.2xlarge"
+
+  # ── DB pool per n8n pod ───────────────────────────────────────────────────────
+  # 20 TypeORM slots per pod. This value shipped as 5, defended as "PgBouncer
+  # queues connections for the ~1ms they are needed"; measured under burst,
+  # that assumption fails. Pool acquisition backlogs (33-54 requests pending
+  # per pod, acquire times of 2-14s), n8n's DB health-check ping races the
+  # SAME pool and times out, and the pod misdiagnoses the healthy database as
+  # dead, silently 503ing every request (91 of 160 webhook pods, roughly two
+  # thirds of all requests, with Aurora and PgBouncer both idle throughout).
+  # pool=20 plus DB_PING_TIMEOUT_MS=20000 eliminated the failure and was kept
+  # as standing config for the rest of the round. PgBouncer in transaction
+  # mode absorbs the upstream connection count; it does not remove the
+  # pod-local queue this pool governs. PgBouncer's own server-pool sizing
+  # lives in pgbouncer.tf.
+  db_postgresdb_pool_size = 20
+
+  # ── Main pods ─────────────────────────────────────────────────────────────────
+  # Mains carry neither webhooks (disableProductionWebhooksOnMainProcess) nor
+  # manual executions (the chart sets OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS), so
+  # this ceiling tracks concurrent editor and REST API users rather than the
+  # ~50-60M executions/day this tier targets. 60 is 10× the module default.
+  # The webhook ceiling below (80) predates the module's own default change
+  # from 8 to 4 and stays unchanged at this tier's sizing: it was 10× the
+  # module default when that default was 8, now it is 20×.
+  #
+  # Floor of 6 keeps warm capacity for the editor and API the way the webhook
+  # floor of 30 does for webhooks. n8n pods take tens of seconds to boot, so a
+  # floor of 2 would put an API burst behind pod startup, and it leaves nothing
+  # spare during a rollout on a tier where mains span only two AZs.
+  #
+  # Neither the node group nor PgBouncer is the constraint. Main pods alone at
+  # this ceiling request 72,000m and open 1,200 client connections at
+  # pool_size=20. With all three families at their ceilings at once, which is
+  # what the node group has to survive, it is 320,000m of the ~785,000m this
+  # node group can schedule (60 x 1,200m main, 320 x 700m worker, 80 x 300m
+  # webhook) and ~9,200 client connections (460 pods x pool_size 20) against
+  # PgBouncer's 12,000 budget (MAX_CLIENT_CONN 3,000 x 4 replicas, sized in
+  # pgbouncer.tf to stay above this ceiling).
+  n8n_main_hpa_min_replicas = var.n8n_main_hpa_min_replicas
+  n8n_main_hpa_max_replicas = 60
+
+  # ── Webhook processors ────────────────────────────────────────────────────────
+  # Floor of 30: 10 pods saturated at ~960 req/s in benchmarks; 30 handles
+  # 500 concurrent VUs cleanly. 4 Gi memory limit halved failure rate vs 2 Gi
+  # under sustained 500 VU load.
+  n8n_webhook_hpa_min_replicas = 30
+  n8n_webhook_hpa_max_replicas = 80
+  n8n_webhook_memory_request   = "1Gi"
+  n8n_webhook_memory_limit     = "4Gi"
+
+  # ── Workers ───────────────────────────────────────────────────────────────────
+  # concurrency=40: doubles the queue slots per pod vs 20, halving the pod
+  # count needed for a given throughput. Floor of 20 keeps the queue draining
+  # during idle periods. Ceiling of 320: the round-2 endurance headline (587
+  # req/s sustained on the representative real workflow) ran at 320 workers.
+  # Past that concurrency setting, throughput at this tier scales in worker
+  # pod count, not in per-pod CPU, so raise the ceiling before the requests. The previous ceiling of 160 was never
+  # observed reaching this tier's target on a real workload.
+  n8n_worker_keda_min_replicas = 20
+  n8n_worker_keda_max_replicas = 320
+  n8n_worker_concurrency       = 40
+
+  # ── Execution settings ────────────────────────────────────────────────────────
+  # Raise the hard concurrency cap from 100 to 2,000 — the default throttles
+  # workers before any infrastructure bottleneck at this scale.
+  # WARNING: pruning settings cannot bound table growth at this tier. n8n's
+  # hard deletion runs at a hardcoded, non-configurable ceiling of 100
+  # executions/s (batchSize=100, rescheduled every 1 second, leader-only),
+  # which is ~8.6M deletions/day. This tier sustains multiples of that, so
+  # execution rows accumulate unboundedly whatever these two values say. They
+  # still matter (they set what the pruner is ALLOWED to reclaim), but plan
+  # for net table growth at any sustained completion rate above ~100/s.
+  n8n_execution_concurrency_limit = 2000
+  n8n_pruning_max_age             = 24
+  n8n_pruning_max_count           = 5000000
+
+  # ── Data-resource deletion controls ─────────────────────────────────────────
+  # Defaults to null, which lets the module's own default apply. Exposed so the
+  # large example's production-considerations checklist can be implemented
+  # without wrapping or forking the module. The db_* deletion controls are
+  # deliberately absent: create_database = false above means the module manages
+  # no RDS instance, so they would be no-ops that only raise the
+  # rds_tuning_requires_module_managed_database warning. The equivalent Aurora
+  # arguments live on aws_rds_cluster.n8n in aurora.tf.
+  s3_force_destroy = var.s3_force_destroy
+
+  # ── Helm timeout ──────────────────────────────────────────────────────────────
+  # Default 600s is too tight for ~52 pods at min replicas (and up to 240+ at
+  # max). 1800s gives time for image pulls, init containers, and KEDA/HPA
+  # propagation across the cluster.
+  n8n_helm_timeout = 1800
+
+  # ── TLS proxy support ───────────────────────────────────────────────────────
+  # Outbound CA trust, inbound proxy hop count, and proxy routing env. See
+  # docs/tls-proxy.md.
+  n8n_extra_ca_pem = var.n8n_extra_ca_pem
+  n8n_proxy_hops   = var.n8n_proxy_hops
+  n8n_extra_env    = var.n8n_extra_env
+
+  tags = local.common_tags
+
+  depends_on = [module.vpc, aws_rds_cluster_instance.writer]
+}
+
+# ── VPC CNI warm-IP tuning ────────────────────────────────────────────────────
+# Default WARM_ENI_TARGET=1 pre-warms one full ENI per node. On m7i.4xlarge
+# (8 ENIs × 30 IPs), 10 nodes exhaust a /20 before any pod is scheduled.
+# WARM_IP_TARGET=2 limits the warm pool to 2 IPs per node — 10 nodes use
+# only 20 IPs instead of 2,400, leaving subnets viable at full scale.
+# This must be applied after the cluster exists — depends_on enforces ordering.
+#
+# Do not set module.n8n's own eks_network_policy_enabled = true alongside
+# this example: that input creates its own aws_eks_addon.vpc_cni inside the
+# module, and AWS rejects two Terraform resources both claiming the same
+# cluster's vpc-cni addon with a ResourceInUseException. Fold
+# enableNetworkPolicy = "true" into this resource's own configuration_values
+# instead if this example needs NetworkPolicy enforcement.
+
+resource "aws_eks_addon" "vpc_cni" {
+  cluster_name                = module.n8n.cluster_name
+  addon_name                  = "vpc-cni"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  configuration_values = jsonencode({
+    env = {
+      WARM_ENI_TARGET   = "0"
+      WARM_IP_TARGET    = "2"
+      MINIMUM_IP_TARGET = "2"
+    }
+  })
+
+  depends_on = [module.n8n]
+}

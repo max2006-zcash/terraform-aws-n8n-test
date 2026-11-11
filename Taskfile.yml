@@ -1,0 +1,179 @@
+# https://taskfile.dev
+#
+# Wraps the local validation loop documented in AGENTS.md so contributors
+# don't need to hand-type the module-root + per-example matrix. CI runs the
+# same underlying commands directly (see .github/workflows/terraform-tests.yml);
+# this file is a convenience wrapper, not a CI dependency.
+version: "3"
+
+vars:
+  # Must stay in lockstep with the `target:` matrix lists in
+  # .github/workflows/terraform-tests.yml (validate, test, test-floor, tflint
+  # and the per-example terraform-docs steps all enumerate the same set). This list
+  # sat at six entries while the four customer-managed examples were added,
+  # which made `task ci` pass locally on a change that broke
+  # examples/customer-managed-everything in CI: an example this wrapper never
+  # visited was, in practice, an example nobody validated before pushing.
+  EXAMPLES: small medium large cloudflare godaddy split-ingress worker-pools customer-managed-redis customer-managed-s3 customer-managed-cluster customer-managed-everything
+
+env:
+  # The veksh/godaddy-dns provider requires credentials even in plan-time tests.
+  GODADDY_API_KEY: stub
+  GODADDY_API_SECRET: stub
+
+tasks:
+  init:
+    internal: true
+    run: once
+    cmds:
+      - terraform init -backend=false
+      - for:
+          var: EXAMPLES
+          as: EXAMPLE
+        cmd: cd examples/{{.EXAMPLE}} && terraform init -backend=false
+
+  fmt:
+    desc: Check Terraform formatting across the module and all examples.
+    cmds:
+      - terraform fmt -check -recursive
+
+  validate:
+    desc: terraform init + validate for the module root and every example.
+    deps: [init]
+    cmds:
+      - terraform validate
+      - for:
+          var: EXAMPLES
+          as: EXAMPLE
+        cmd: cd examples/{{.EXAMPLE}} && terraform validate
+
+  test:
+    desc: terraform test (plan-time, mocked providers) for the module root and every example.
+    deps: [init]
+    cmds:
+      - terraform test -verbose
+      - for:
+          var: EXAMPLES
+          as: EXAMPLE
+        cmd: cd examples/{{.EXAMPLE}} && terraform test -verbose
+
+  chart:
+    desc: Render and check main topology with the pinned n8n chart (requires Helm and jq).
+    deps: [init]
+    cmds:
+      - ./tests/scripts/check-main-chart.sh
+
+  chart-coverage:
+    desc: Check docs/helm-chart-coverage.md against the pinned n8n chart's values.yaml (requires Helm).
+    cmds:
+      - ./tests/scripts/check-helm-chart-coverage.sh
+
+  chart-diff:
+    desc: >-
+      Diff the pinned n8n chart's values.yaml against a candidate version
+      (requires Helm). Run before moving the pin, e.g. task chart-diff CANDIDATE=1.12.0
+    cmds:
+      - ./tests/scripts/chart-values-diff.sh "{{.CANDIDATE}}"
+
+  version-drift:
+    desc: Report every version pin that has fallen behind upstream (see docs/versioning.md). Never fails; requires curl, jq and python3.
+    cmds:
+      - ./tests/scripts/check-version-drift.sh
+
+  drift-constraints:
+    desc: Offline unit test for the version-constraint evaluator check-version-drift.sh uses (requires python3).
+    cmds:
+      - ./tests/scripts/test-version-drift-constraints.sh
+
+  lint:
+    desc: tflint for the module root and every example.
+    deps: [init]
+    cmds:
+      - tflint --init
+      - tflint --format compact
+      - for:
+          var: EXAMPLES
+          as: EXAMPLE
+        cmd: cd examples/{{.EXAMPLE}} && tflint --init && tflint --format compact
+
+  checkov:
+    desc: >-
+      Static analysis, the same invocation CI runs. Requires the exact checkov
+      version CHECKOV_VERSION pins in .github/workflows/terraform-tests.yml;
+      the script refuses to run against any other, because which checks apply
+      is version-dependent. Install with
+      `pip install "checkov==<pinned version>"`.
+    cmds:
+      - ./tests/scripts/check-checkov.sh
+
+  terraform-floor:
+    desc: >-
+      Check every required_version declaration (root, modules/*, examples/*)
+      matches TF_FLOOR_VERSION in .github/workflows/terraform-tests.yml, the
+      version CI's test-floor job runs (see docs/versioning.md).
+    cmds:
+      - ./tests/scripts/check-terraform-floor.sh
+
+  banners:
+    desc: >-
+      Check every variable/output block in variables.tf and outputs.tf sits under
+      a "# ── Section ──" banner (see AGENTS.md). Local-only for now, not yet a
+      CI-gated check.
+    cmds:
+      - ./scripts/check-variable-banners.sh
+
+  example-parity:
+    desc: >-
+      Diff the variable names every example's variables.tf declares against
+      examples/small for undeclared drift, and require a "Production considerations" README section wherever
+      the module still creates RDS or S3 (see #136). Local-only for now, not yet
+      a CI-gated check.
+    cmds:
+      - ./scripts/check-example-parity.sh
+
+  docs:
+    desc: Check README.md is not stale relative to variables.tf/outputs.tf (module root and every example).
+    cmds:
+      - terraform-docs --output-check .
+      - for:
+          var: EXAMPLES
+          as: EXAMPLE
+        cmd: cd examples/{{.EXAMPLE}} && terraform-docs --output-check .
+
+  docs-generate:
+    desc: Regenerate README.md from variables.tf/outputs.tf (module root and every example).
+    cmds:
+      - terraform-docs .
+      - for:
+          var: EXAMPLES
+          as: EXAMPLE
+        cmd: cd examples/{{.EXAMPLE}} && terraform-docs .
+
+  markdown:
+    desc: markdownlint against README.md, docs/*.md, CONTRIBUTING.md, and AGENTS.md (not CHANGELOG.md/ROADMAP.md/SECURITY.md; CI-gated via the markdownlint job; see .markdownlint.jsonc).
+    cmds:
+      - markdownlint README.md CONTRIBUTING.md AGENTS.md docs/*.md
+
+  ci:
+    desc: >-
+      Run the full local loop (fmt, validate, test, chart, chart-coverage,
+      drift-constraints, lint, terraform-floor, banners, example-parity, docs,
+      markdown). Mirrors every CI job except checkov, which is a hard-fail gate in CI but is left out
+      here because it needs a pinned checkov install that the other tasks do
+      not: run `task checkov` separately once you have it. `test` runs on the
+      local terraform only; CI's test-floor job repeats it on
+      TF_FLOOR_VERSION. Also runs banners and example-parity, which CI does
+      not gate on at all.
+    cmds:
+      - task: fmt
+      - task: validate
+      - task: test
+      - task: chart
+      - task: chart-coverage
+      - task: drift-constraints
+      - task: lint
+      - task: terraform-floor
+      - task: banners
+      - task: example-parity
+      - task: docs
+      - task: markdown

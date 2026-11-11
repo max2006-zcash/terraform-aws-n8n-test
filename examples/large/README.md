@@ -1,0 +1,224 @@
+# n8n on AWS — Large Deployment
+
+Production-grade n8n for **~50–60M executions per day** (~350–960 req/s average). Uses Amazon Aurora PostgreSQL with I/O-Optimized storage, PgBouncer for connection pooling, and Route53 for automated DNS and certificate management.
+
+> **Aurora support scope:** n8n does not officially support Amazon Aurora PostgreSQL or other Postgres-compatible derivatives. This example is kept for its I/O-Optimized throughput characteristics (see below), but Aurora is not tested or certified by n8n, and issues that reproduce only on Aurora are outside official support scope. If that matters for your deployment, use the module-managed RDS instance (`create_database = true`) instead, sized for your throughput tier.
+
+## Architecture
+
+```
+Route 53 (alias A-record)
+    └─► ALB (AWS LBC) ──► EKS (10–50 × m7i.4xlarge)
+                               ├─► n8n main pods (HPA, min=6 / max=60)
+                               ├─► n8n webhook processors (HPA, min=30 / max=80)
+                               └─► n8n workers (KEDA, min=20 / max=320)
+                                        ├─► PgBouncer (4 replicas, transaction mode)
+                                        │        └─► Aurora PostgreSQL (writer + reader)
+                                        └─► ElastiCache Redis cache.r6g.2xlarge
+```
+
+## Key sizing decisions
+
+| Resource | Value | Rationale |
+|---|---|---|
+| Node type | m7i.4xlarge (16 vCPU, 64 GB) | x86_64 required with AL2023_x86_64_STANDARD AMI; Graviton requires separate AMI type |
+| Node count | desired=10, min=10, max=50 | Warm floor of 10; 50 max covers 2,400 req/s peaks |
+| Node disk | 100 GiB root volume (`node_disk_size`) | The EKS default of 20 GiB filled fleet-wide under image plus execution-data churn on this deployment class and evicted every pod on the node group; that incident is what motivated the module input |
+| VPC private subnets | 2× /20 (4,094 IPs each) | /24s exhausted by default VPC CNI warm-IP pools at 20+ large nodes |
+| VPC CNI tuning | WARM_ENI_TARGET=0, WARM_IP_TARGET=2 | Reduces pre-warmed IPs from ~2,400 to 20 across 10 nodes |
+| Database | Aurora PostgreSQL I/O-Optimized | Removes IOPS ceiling; 14,000–15,000 TPS sustained vs ~600 req/s ceiling on RDS gp3 |
+| Aurora instances | 1 writer + 1 reader | Automatic failover; reader offloads reporting queries |
+| PgBouncer | 4 replicas, transaction mode | ~9,200 potential client connections at the pod ceilings (80 webhook + 320 worker + 60 main, pool_size=20) against a 12,000 budget (`MAX_CLIENT_CONN=3000` x 4). Two replicas (6,000) would be oversubscribed, and exceeding `max_client_conn` queues new clients, recreating the pool-acquisition backlog the pool sizing exists to prevent. Transaction mode confirmed compatible with n8n TypeORM |
+| DB pool per pod | `db_postgresdb_pool_size = 20` | Shipped as 5 and measured failing under burst: pool acquisition backlogged to 33-54 pending per pod (2-14 s acquires), n8n's DB health-check ping races the same pool and times out, and the pod misdiagnoses a healthy database as dead, silently 503ing every request (91 of 160 webhook pods, roughly two thirds of requests, Aurora and PgBouncer idle). Pool 20 plus `DB_PING_TIMEOUT_MS=20000` eliminated it |
+| Redis | cache.r6g.2xlarge | Measured hard ceiling: 869 req/s on cache.r6g.large, 897-906 req/s on 2xlarge with no other change. Every execution crosses the Bull queue, so at this tier's target the large node is the bottleneck |
+| Main pods | min=6, max=60 | Mains serve the editor and REST API only, not webhooks or manual executions, so the ceiling tracks concurrent users rather than executions/day; 10× the module default. Floor of 6 keeps warm editor/API capacity, since n8n pods take tens of seconds to boot |
+| Webhook pods | min=30, max=80 | 10 pods saturated at ~960 req/s; 30 pod floor handles 500 concurrent VUs cleanly |
+| Worker pods | min=20, max=320 | The 587 req/s endurance headline on the representative real workflow ran at 320 workers; throughput at this tier scales in worker pod count, not per-pod CPU. The previous ceiling of 160 was never observed reaching the tier's target on a real workload |
+| Worker concurrency | 40 | Doubles the queue slots per pod vs 20, halving the pod count needed for a given throughput |
+| Execution concurrency limit | 2,000 | Default 100 throttles workers before any infrastructure bottleneck |
+| Pruning | 24h / 5M records | These values set what the pruner is allowed to reclaim, but they cannot bound table growth at this tier: n8n's hard deletion runs at a hardcoded ceiling of 100 executions/s (~8.6M/day, leader-only), and this tier sustains multiples of that. Plan for net `execution_entity` growth at any sustained completion rate above ~100/s |
+| Webhook memory | 4 Gi limit / 1 Gi request | 2 Gi caused memory-pressure 503s under 500 VU load; 4 Gi halved failure rate |
+
+## Estimated cost (us-east-1, on-demand)
+
+| Resource | Monthly |
+|---|---|
+| EKS nodes (10 × m7i.4xlarge, desired) | ~$5,887 |
+| EKS nodes (50 × m7i.4xlarge, at max) | ~$29,434 |
+| Aurora writer db.r6g.8xlarge | ~$5,606 |
+| Aurora reader db.r6g.8xlarge | ~$5,606 |
+| ElastiCache cache.r6g.2xlarge | ~$480 |
+| EKS control plane | ~$73 |
+| NAT Gateways (2× HA) | ~$70 |
+| **Total (10 nodes steady-state)** | **~$17,700** |
+| **Total (50 nodes peak)** | **~$41,300** |
+
+1-year Reserved Instances reduce compute ~35%. If load is concentrated in business hours, KEDA/HPA autoscaling (rather than fixed min=desired) reduces average node spend by 30–40%.
+
+## Apply order
+
+Aurora must be provisioned before n8n starts — n8n pods attempt a database connection on startup. The `depends_on = [aws_rds_cluster_instance.writer]` in `main.tf` enforces this within a single `terraform apply`.
+
+```bash
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your values
+
+terraform init
+terraform apply -compact-warnings   # ~30 min: Aurora provisioning dominates
+```
+
+After apply, retrieve credentials:
+
+```bash
+terraform output -raw db_password
+terraform output -raw n8n_encryption_key
+```
+
+Configure kubectl:
+
+```bash
+$(terraform output -raw kubectl_config_command)
+```
+
+## Operational notes
+
+**Before each benchmark or high-load test:**
+```bash
+NS=$(terraform output -raw namespace)
+
+# 1. Flush Redis (stale Bull state causes worker errors after pod restarts)
+kubectl run redis-flush --rm -it --restart=Never --image=redis:7-alpine -n "$NS" \
+  -- redis-cli -h <redis-host> FLUSHALL
+
+# 2. Restart all pods for clean connection pools
+kubectl rollout restart deployment/n8n-worker deployment/n8n-webhook-processor \
+  deployment/n8n-main deployment/pgbouncer -n "$NS"
+kubectl rollout status deployment/n8n-worker deployment/n8n-webhook-processor \
+  deployment/n8n-main deployment/pgbouncer -n "$NS" --timeout=300s
+
+# 3. Wait for Aurora active connections to return to baseline before starting load
+```
+
+**If "Database is not ready!" errors persist after config changes:**
+1. Check for stale Bull jobs: flush all `bull:*` Redis keys.
+2. Restart PgBouncer once (`kubectl rollout restart deployment/pgbouncer`) to drop ghost Aurora connections.
+3. If still stuck: scale all n8n pods to 0, wait for Aurora to show <10 connections, then scale back up.
+
+**KMS key after `terraform destroy`:**
+
+The Aurora cluster's CMK (`alias/${cluster_name}-aurora-<auto-generated suffix>`) enters a mandatory 7-day `PendingDeletion` window on `terraform destroy`. The key continues to bill ~$0.03/day during the window — negligible (~$0.21 per cycle), but the keys accumulate in the AWS console if you cycle `apply`/`destroy` repeatedly. Because the alias uses `name_prefix`, the alias name is unique per apply: **re-applying with the same `cluster_name` works immediately** without waiting for the window to expire or running `cancel-key-deletion` workarounds.
+
+**Upgrading from a pre-CMK apply.** If you applied an earlier revision of this example (before this PR) where the Aurora cluster was created with `storage_encrypted = true` plus the AWS-managed `aws/rds` key, the first `terraform plan` after pulling this change will show `aws_rds_cluster.n8n` being **destroyed and recreated**. Aurora does not support re-encryption in place — snapshot the cluster first if you need to preserve data, then restore from the snapshot post-apply.
+
+## Production considerations
+
+This example is a reference deployment optimized for clean `apply` / `destroy` cycles during evaluation and load testing. Before promoting it to production, review and flip the teardown-friendly defaults baked into both this example and the underlying module:
+
+| Where | Setting | Current | Production |
+|---|---|---|---|
+| `examples/large/aurora.tf` | `aws_rds_cluster.n8n.deletion_protection` | `false` | `true` |
+| `examples/large/aurora.tf` | `aws_rds_cluster.n8n.skip_final_snapshot` | `true` | `false`, plus set `final_snapshot_identifier` |
+| `examples/large/variables.tf` | `s3_force_destroy` (passed through to the module) | `true` | `false` |
+
+The module's `db_deletion_protection`, `db_skip_final_snapshot`, `db_final_snapshot_identifier` and `db_delete_automated_backups` inputs do not apply here: this example sets `create_database = false`, so the module manages no RDS instance and setting them only raises the `rds_tuning_requires_module_managed_database` warning. Configure the equivalent arguments on `aws_rds_cluster.n8n` in `aurora.tf` instead, as the first two rows show. `s3_force_destroy` does apply, since the module still owns the bucket, and is exposed as this example's own variable so it can be set in `terraform.tfvars`.
+
+The Aurora cluster also carries a `# checkov:skip=CKV_AWS_139` annotation that should be removed once `deletion_protection = true` is set. The annotation exists specifically because flipping the default would break this example's documented `terraform destroy` flow, not because the underlying check is wrong.
+
+**Upgrading to chart `1.13.0` can interrupt workers.** This example runs a worker floor of 20. The first upgrade to n8n chart `1.13.0` (the module default from this release) resets the worker Deployment's desired count to 1 before KEDA scales it back, and executions still running on terminated pods when their shutdown window ends can be interrupted. Upgrade in a low-traffic window and let running work drain first; see [Upgrading n8n](../../docs/upgrading-n8n.md#moving-from-chart-1120-to-1130).
+
+See [`docs/build-time-decisions.md`](../../docs/build-time-decisions.md) for the module-level settings (EKS cluster name and subnet removal, the node group's instance type and disk size, ElastiCache topology and encryption, the ALB scheme, S3 bucket name and encryption, and the n8n encryption key) that are fixed or constrained after the first `terraform apply`. The RDS rows there do not apply, because this example sets `create_database = false`. The Aurora cluster in `aurora.tf` is created by this example, not by the module, so that page does not cover its create-time constraints.
+
+## Reference
+
+<!-- BEGIN_TF_DOCS -->
+## Requirements
+
+| Name | Version |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.13 |
+| <a name="requirement_aws"></a> [aws](#requirement\_aws) | ~> 6.0 |
+| <a name="requirement_helm"></a> [helm](#requirement\_helm) | ~> 3.0 |
+| <a name="requirement_kubernetes"></a> [kubernetes](#requirement\_kubernetes) | ~> 3.0 |
+| <a name="requirement_random"></a> [random](#requirement\_random) | ~> 3.0 |
+
+## Providers
+
+| Name | Version |
+| ---- | ------- |
+| <a name="provider_aws"></a> [aws](#provider\_aws) | ~> 6.0 |
+| <a name="provider_kubernetes"></a> [kubernetes](#provider\_kubernetes) | ~> 3.0 |
+| <a name="provider_random"></a> [random](#provider\_random) | ~> 3.0 |
+
+## Modules
+
+| Name | Source | Version |
+| ---- | ------ | ------- |
+| <a name="module_n8n"></a> [n8n](#module\_n8n) | ../.. | n/a |
+| <a name="module_vpc"></a> [vpc](#module\_vpc) | terraform-aws-modules/vpc/aws | ~> 5.0 |
+
+## Resources
+
+| Name | Type |
+| ---- | ---- |
+| [aws_cloudwatch_log_group.aurora_postgresql](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_log_group) | resource |
+| [aws_db_parameter_group.aurora](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/db_parameter_group) | resource |
+| [aws_db_subnet_group.aurora](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/db_subnet_group) | resource |
+| [aws_eks_addon.vpc_cni](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eks_addon) | resource |
+| [aws_iam_role.rds_enhanced_monitoring](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
+| [aws_iam_role_policy_attachment.rds_enhanced_monitoring](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment) | resource |
+| [aws_kms_alias.aurora](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/kms_alias) | resource |
+| [aws_kms_key.aurora](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/kms_key) | resource |
+| [aws_rds_cluster.n8n](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster) | resource |
+| [aws_rds_cluster_instance.reader](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster_instance) | resource |
+| [aws_rds_cluster_instance.writer](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster_instance) | resource |
+| [aws_rds_cluster_parameter_group.aurora](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster_parameter_group) | resource |
+| [aws_security_group.aurora](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
+| [kubernetes_deployment.pgbouncer](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/deployment) | resource |
+| [kubernetes_namespace.pgbouncer](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/namespace) | resource |
+| [kubernetes_pod_disruption_budget_v1.pgbouncer](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/pod_disruption_budget_v1) | resource |
+| [kubernetes_secret.pgbouncer](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/secret) | resource |
+| [kubernetes_service.pgbouncer](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/service) | resource |
+| [random_password.aurora](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/password) | resource |
+| [aws_availability_zones.available](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/availability_zones) | data source |
+| [aws_caller_identity.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/caller_identity) | data source |
+
+## Inputs
+
+| Name | Description | Type | Default | Required |
+| ---- | ----------- | ---- | ------- | :------: |
+| <a name="input_aurora_instance_class"></a> [aurora\_instance\_class](#input\_aurora\_instance\_class) | Aurora PostgreSQL instance class for both the writer and reader. db.r6g.8xlarge (32 vCPU, 256 GB) is validated for this example's target throughput of ~50–60+M executions/day. Scale down for lower throughput targets or Reserved Instance pricing. | `string` | `"db.r6g.8xlarge"` | no |
+| <a name="input_aurora_query_logging_enabled"></a> [aurora\_query\_logging\_enabled](#input\_aurora\_query\_logging\_enabled) | Create and attach Aurora PostgreSQL 18 parameter groups that enforce rds.force\_ssl and log DDL plus queries slower than 1 second. Defaults to false so upgrading an existing example deployment retained on Aurora 16 by lifecycle.ignore\_changes does not try to attach incompatible Aurora 18 parameter groups. Enable only for a new deployment or after confirming the live cluster runs the configured 18.4 major. | `bool` | `false` | no |
+| <a name="input_aws_partner_attribution_tag"></a> [aws\_partner\_attribution\_tag](#input\_aws\_partner\_attribution\_tag) | Value of the aws-apn-id tag added to every taggable AWS resource this example and the module create, so AWS Partner Revenue Measurement attributes their spend to n8n. Passed to the module's aws\_partner\_attribution\_tag and merged into this example's own tags, which is how the VPC, NAT gateway and any stand-in infrastructure get it. This input owns the tag: an aws-apn-id key in tags is ignored. Set to an empty string to remove the tag from resources Terraform manages and stop new load balancers and volumes receiving it; EBS volumes that already exist keep it. Keep the default and validation in sync with the module root's variables.tf. | `string` | `"pc:26au7o6cdeh7fqdt376h9m9xk"` | no |
+| <a name="input_aws_region"></a> [aws\_region](#input\_aws\_region) | AWS region to deploy into (e.g. us-east-1, eu-west-1, ap-southeast-1). | `string` | `"us-east-1"` | no |
+| <a name="input_certificate_arn"></a> [certificate\_arn](#input\_certificate\_arn) | ARN of a pre-validated ACM certificate covering n8n\_domain. Set this when you already manage your certificate lifecycle outside this example (for example a wildcard cert reused across multiple deployments). Set exactly one of route53\_zone\_id or certificate\_arn. | `string` | `null` | no |
+| <a name="input_cluster_name"></a> [cluster\_name](#input\_cluster\_name) | Name for the EKS cluster. Keep to 14 characters or fewer — the module derives an ElastiCache cluster ID of `<cluster_name>-redis`, and AWS caps ElastiCache IDs at 20 chars. Use only lowercase letters, digits and hyphens: the name is also used for the EKS cluster, which does not accept periods, and in the S3 bucket name `n8n-<cluster_name>-<id>`, which does not accept uppercase letters or underscores. The module rejects uppercase letters and underscores at plan time. | `string` | `"n8n-large"` | no |
+| <a name="input_n8n_custom_extensions_path"></a> [n8n\_custom\_extensions\_path](#input\_n8n\_custom\_extensions\_path) | Absolute path inside the n8n container that n8n scans for custom nodes at startup (e.g. "/opt/n8n-nodes"). Maps to N8N\_CUSTOM\_EXTENSIONS, and is set on main, worker and webhook processor pods alike. Set this alongside n8n\_image\_repository when the custom image bakes community packages in: since n8n 1.0 the loader no longer reads the image's global node\_modules, so a plain npm install into the image is never scanned and the packages ship but never load. Nodes found here register under the package name CUSTOM, so a node installed from npm as n8n-nodes-example.myNode becomes CUSTOM.myNode and existing workflows referencing the npm-qualified type will not resolve. Leave null (the default) to omit the env var. | `string` | `null` | no |
+| <a name="input_n8n_domain"></a> [n8n\_domain](#input\_n8n\_domain) | Fully-qualified domain name for n8n (e.g. n8n.example.com). The parent zone must either be hosted in Route53 (pass its ID via route53\_zone\_id) or covered by a pre-validated ACM certificate (pass its ARN via certificate\_arn). | `string` | n/a | yes |
+| <a name="input_n8n_execution_data_storage_mode"></a> [n8n\_execution\_data\_storage\_mode](#input\_n8n\_execution\_data\_storage\_mode) | Where n8n stores the data of each new execution. Passed to the module's n8n\_execution\_data\_storage\_mode. "database" keeps execution data in PostgreSQL; "s3" offloads it to the S3 bucket the module already creates for binary data, which is the main lever for relieving write pressure on the database at this tier's volume. Requires n8n >= 2.27 (pin n8n\_image\_tag accordingly) and an Enterprise license carrying the feat:executionDataS3 entitlement, which is not the same one binary data offload uses. There is no backfill: existing executions stay readable where they were written. Read the execution data section of the root README before enabling it, in particular the durability trade-off and the S3 lifecycle constraint. | `string` | `"database"` | no |
+| <a name="input_n8n_extra_ca_pem"></a> [n8n\_extra\_ca\_pem](#input\_n8n\_extra\_ca\_pem) | Passed to the module's n8n\_extra\_ca\_pem: PEM CA certificate(s) trusted by the main, worker and webhook-processor pods for outbound TLS, for a TLS-inspecting egress proxy or a private CA; task-runner sidecars are not covered. Certificates only, never a private key. Leave null (the default) to add none. See [TLS proxy guide](../../docs/tls-proxy.md). | `string` | `null` | no |
+| <a name="input_n8n_extra_env"></a> [n8n\_extra\_env](#input\_n8n\_extra\_env) | Passed to the module's n8n\_extra\_env: extra environment variables for the n8n containers on every role (main, worker, webhook processor), not the task runner sidecars, e.g. HTTP\_PROXY, HTTPS\_PROXY and NO\_PROXY for an egress proxy. The module rejects names it manages. Values are stored in plaintext in Terraform state and the Helm release, so never embed credentials in a proxy URL (http://user:pass@proxy). See [TLS proxy guide](../../docs/tls-proxy.md). | <pre>list(object({<br/>    name  = string<br/>    value = string<br/>  }))</pre> | `[]` | no |
+| <a name="input_n8n_image_pull_secrets"></a> [n8n\_image\_pull\_secrets](#input\_n8n\_image\_pull\_secrets) | Names of existing Kubernetes secrets of type kubernetes.io/dockerconfigjson, in the n8n namespace, that the pods authenticate to their image registry with. Leave empty (the default) unless n8n\_image\_repository points somewhere the node group's IAM role cannot already reach: a public registry and an ECR repository in this account both pull without credentials. Setting it hands ownership of the n8n ServiceAccount from the Helm chart to the module, which is how the secrets reach the pods at all, since the pinned chart renders imagePullSecrets nowhere. Create and rotate the secrets yourself; the module takes names, not credentials, so none of them land in Terraform state. Cross-account ECR is the exception and should not use this: its authorization tokens expire after 12 hours, so add the node group role to the source repository's policy instead. | `list(string)` | `[]` | no |
+| <a name="input_n8n_image_repository"></a> [n8n\_image\_repository](#input\_n8n\_image\_repository) | Container image repository for the n8n application, without a tag (e.g. "123456789012.dkr.ecr.eu-west-1.amazonaws.com/n8n"). Leave null to use the Helm chart's own repository (docker.n8n.io/n8nio/n8n). Set this to run a custom image, for example one with community packages baked in so they are not reinstalled on every pod boot. The image must be pullable by the node group's IAM role (ECR in the same account is) or be public, otherwise name a dockerconfigjson secret in n8n\_image\_pull\_secrets, and n8n\_task\_runner\_image\_tag usually has to be set alongside it. | `string` | `null` | no |
+| <a name="input_n8n_image_tag"></a> [n8n\_image\_tag](#input\_n8n\_image\_tag) | n8n application image tag to deploy (e.g. "2.27.4"). Leave null to use the selected Helm chart's default (appVersion 2.43.5 in chart 1.16.0). Inspect and pin the running application version before upgrading the chart to avoid a downgrade; see the [upgrade guide](../../docs/upgrading-n8n.md). | `string` | `null` | no |
+| <a name="input_n8n_license_key"></a> [n8n\_license\_key](#input\_n8n\_license\_key) | n8n license activation key. Requires Enterprise with feat:multipleMainInstances by default; Business is supported with n8n\_main\_hpa\_min\_replicas = 1. Get one at https://n8n.io/pricing | `string` | n/a | yes |
+| <a name="input_n8n_main_hpa_min_replicas"></a> [n8n\_main\_hpa\_min\_replicas](#input\_n8n\_main\_hpa\_min\_replicas) | Minimum (and default) replica count for n8n main pods, passed straight through to the module's own n8n\_main\_hpa\_min\_replicas. Defaults to 6 here, not the module's own default of 2, to match this tier's editor/API concurrency floor (see the comment beside its use in main.tf): mains carry no webhooks or manual executions, so this ceiling tracks concurrent editor and REST API users rather than raw execution throughput. 6 replicas needs an Enterprise/Startup license carrying feat:multipleMainInstances. Set to 1 to run a single main pod in plain queue mode instead, which only needs a Business-tier license: n8n's multi-main leader-election gate never engages at 1 replica. | `number` | `6` | no |
+| <a name="input_n8n_proxy_hops"></a> [n8n\_proxy\_hops](#input\_n8n\_proxy\_hops) | Passed to the module's n8n\_proxy\_hops: number of proxies in front of n8n that add an X-Forwarded-For entry (the module's own ALB counts as 1, an additional proxy or WAF that adds its own entry makes 2). At any hop count of 1 or more, a caller that bypasses the declared proxy chain can forge X-Forwarded-For and spoof its client IP, including an in-cluster caller that reaches the n8n Services directly. When a proxy sits in front of the ALB, restrict the ALB to that proxy's egress addresses with the module's alb\_inbound\_cidrs or alb\_inbound\_prefix\_list\_ids input, which this example does not pass through (add it in main.tf), and keep in-cluster callers off the n8n Services. Leave null (the default) to use the module's default of 1. See [TLS proxy guide](../../docs/tls-proxy.md). | `number` | `null` | no |
+| <a name="input_n8n_task_runner_image_repository"></a> [n8n\_task\_runner\_image\_repository](#input\_n8n\_task\_runner\_image\_repository) | Container image repository for the task runner sidecar (n8nio/runners), without a tag or digest (e.g. "123456789012.dkr.ecr.eu-west-1.amazonaws.com/n8n-runners"). Leave null to use the Helm chart's own repository (n8nio/runners). Set alongside n8n\_image\_repository when mirroring both images into the same private registry; the two are independent. Use n8n\_task\_runner\_image\_tag for the runner tag. Private-registry pull access is granted the same way as n8n\_image\_repository, through n8n\_image\_pull\_secrets on the module-managed ServiceAccount. | `string` | `null` | no |
+| <a name="input_n8n_task_runner_image_tag"></a> [n8n\_task\_runner\_image\_tag](#input\_n8n\_task\_runner\_image\_tag) | Image tag for the task runner sidecar (`n8nio/runners`). Leave null to inherit the n8n application image's tag, which is correct as long as that tag is a published n8n version. Set it to the underlying n8n version when running a custom image whose tag is not one (e.g. n8n\_image\_tag = "2.27.4-mypackages" together with n8n\_task\_runner\_image\_tag = "2.27.4"); otherwise the sidecar image cannot be pulled and every pod carrying a runner stays in ImagePullBackOff (workers only in upstream chart 1.16.0 queue mode). | `string` | `null` | no |
+| <a name="input_route53_zone_id"></a> [route53\_zone\_id](#input\_route53\_zone\_id) | Route53 hosted zone ID for the parent of n8n\_domain. Set this when you want the example to issue the ACM certificate and create the alias record automatically. Set exactly one of route53\_zone\_id or certificate\_arn. | `string` | `null` | no |
+| <a name="input_s3_force_destroy"></a> [s3\_force\_destroy](#input\_s3\_force\_destroy) | Passed to the module's s3\_force\_destroy. Leave null (the default) to use the module's teardown-friendly default of true. | `bool` | `null` | no |
+| <a name="input_tags"></a> [tags](#input\_tags) | Additional AWS tags to apply to every resource this example creates. | `map(string)` | `{}` | no |
+
+## Outputs
+
+| Name | Description |
+| ---- | ----------- |
+| <a name="output_alb_hostname"></a> [alb\_hostname](#output\_alb\_hostname) | ALB hostname. The alias A-record for n8n\_domain is already created in Route53 — this output is informational. |
+| <a name="output_aurora_reader_endpoint"></a> [aurora\_reader\_endpoint](#output\_aurora\_reader\_endpoint) | Aurora cluster reader endpoint — use this for read-only reporting queries. |
+| <a name="output_aurora_writer_endpoint"></a> [aurora\_writer\_endpoint](#output\_aurora\_writer\_endpoint) | Aurora cluster writer endpoint — used by PgBouncer to connect to the primary instance. |
+| <a name="output_db_password"></a> [db\_password](#output\_db\_password) | Aurora PostgreSQL password — back this up in a password manager. |
+| <a name="output_kubectl_config_command"></a> [kubectl\_config\_command](#output\_kubectl\_config\_command) | Command to configure kubectl for this cluster. |
+| <a name="output_n8n_encryption_key"></a> [n8n\_encryption\_key](#output\_n8n\_encryption\_key) | n8n encryption key — back this up in a password manager. |
+| <a name="output_n8n_url"></a> [n8n\_url](#output\_n8n\_url) | URL to access n8n once the ALB finishes provisioning (~5 min after apply). |
+| <a name="output_namespace"></a> [namespace](#output\_namespace) | Kubernetes namespace n8n is deployed into. |
+<!-- END_TF_DOCS -->

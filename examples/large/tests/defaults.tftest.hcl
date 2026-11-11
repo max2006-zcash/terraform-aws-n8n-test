@@ -1,0 +1,627 @@
+# Plan-time tests for the large example using mocked providers.
+#
+# Run: terraform test
+#   (from examples/large/ — requires terraform >= 1.7)
+
+# NOTE on the certificate path used by these tests:
+#
+# Production usage of examples/large/ is the Route53 path: set route53_zone_id
+# and the module issues an ACM cert and writes the alias record automatically.
+# We use the BYO-cert path here (certificate_arn = stub), gated by
+# `local.dns_automated = var.route53_zone_id != null`, so leaving
+# route53_zone_id null and supplying certificate_arn exercises that branch.
+#
+# This was originally a workaround rather than a choice: dns.tf used to
+# `for_each` over aws_acm_certificate.n8n[0].domain_validation_options, which is
+# unknown at plan time under a mocked provider, and mock_resource and
+# override_resource both silently no-op for that computed-set-of-object
+# attribute. That stopped being true at c914416 (#58, multi-hostname
+# certificates), which rekeyed the validation records off local.acm_domain_names
+# so the for_each keys come from the domain inputs and only the record values
+# stay computed. examples/worker-pools plans the Route53 path under mocks today,
+# which is the empirical proof.
+#
+# The path stays BYO-cert here because it is a branch worth covering, not
+# because the Route53 one is blocked.
+
+mock_provider "aws" {
+  override_data {
+    target = data.aws_availability_zones.available
+    values = {
+      names = ["us-east-1a", "us-east-1b", "us-east-1c"]
+    }
+  }
+}
+
+mock_provider "kubernetes" {}
+mock_provider "helm" {}
+
+variables {
+  n8n_domain      = "n8n.test.example.com"
+  n8n_license_key = "test-license-key-not-real"
+  # route53_zone_id is set to null explicitly so a developer's terraform.tfvars
+  # cannot fall through and re-enable the dns.tf for_each path that the
+  # certificate_arn stub is meant to bypass.
+  route53_zone_id = null
+  certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/test-cert"
+}
+
+run "cluster_name_length_validation_rejects_long_names" {
+  command = plan
+
+  variables {
+    cluster_name = "this-cluster-name-is-definitely-too-long"
+  }
+
+  expect_failures = [var.cluster_name]
+}
+
+run "aurora_instance_class_validation_rejects_invalid" {
+  command = plan
+
+  variables {
+    aurora_instance_class = "r6g.8xlarge"
+  }
+
+  expect_failures = [var.aurora_instance_class]
+}
+
+run "cert_xor_validation_rejects_both" {
+  command = plan
+
+  variables {
+    route53_zone_id = "Z00000000000000000000"
+    certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/test-cert"
+  }
+
+  expect_failures = [var.certificate_arn]
+}
+
+run "cert_xor_validation_rejects_neither" {
+  command = plan
+
+  variables {
+    route53_zone_id = null
+    certificate_arn = null
+  }
+
+  expect_failures = [var.certificate_arn]
+}
+
+# ── Aurora topology ──────────────────────────────────────────────────────────
+
+run "aurora_cluster_topology" {
+  command = plan
+
+  assert {
+    condition     = aws_rds_cluster.n8n.engine == "aurora-postgresql"
+    error_message = "Aurora cluster engine must be aurora-postgresql"
+  }
+
+  assert {
+    condition     = aws_rds_cluster.n8n.storage_type == "aurora-iopt1"
+    error_message = "Aurora cluster must use I/O-Optimized storage at this throughput tier"
+  }
+
+  assert {
+    condition     = aws_rds_cluster.n8n.engine_version == "18.4"
+    error_message = "Aurora engine_version pinned to 18.4 to track the newest supported Postgres major"
+  }
+}
+
+# Parameter groups default off because lifecycle.ignore_changes can retain an
+# existing Aurora 16 cluster while this configuration says 18.4. The groups are
+# safe only when the live and configured majors match.
+run "aurora_parameter_groups_default_to_absent" {
+  command = plan
+
+  assert {
+    condition     = length(aws_rds_cluster_parameter_group.aurora) == 0 && length(aws_db_parameter_group.aurora) == 0
+    error_message = "Aurora parameter groups must default off so an upgrade cannot attach Aurora 18 groups to a live Aurora 16 cluster."
+  }
+}
+
+# Both parameter groups' `family` has to track the cluster's major version, and
+# all three resources are separate, so local.aurora_engine_version is what keeps
+# them together. A mismatch is not caught until the apply fails against the RDS
+# API.
+#
+# The split between the two groups is not cosmetic and is the thing most likely
+# to be "tidied" back into one group by a later refactor: Aurora PostgreSQL
+# exposes rds.force_ssl only at cluster level and log_statement /
+# log_min_duration_statement only at instance level, so moving a parameter to
+# the other group produces a plan that looks fine and an apply that fails with
+# "Could not find parameter with name". These two run blocks pin each group's
+# exact contents so that refactor fails here instead. See aurora.tf for the
+# describe-engine-default-cluster-parameters call that establishes the split.
+run "aurora_cluster_parameter_group" {
+  command = plan
+
+  variables {
+    aurora_query_logging_enabled = true
+  }
+
+  assert {
+    condition     = aws_rds_cluster_parameter_group.aurora[0].family == "aurora-postgresql18"
+    error_message = "The cluster parameter group family must match the cluster's major engine version (18.x)."
+  }
+
+  assert {
+    condition = { for p in aws_rds_cluster_parameter_group.aurora[0].parameter : p.name => p.value } == {
+      "rds.force_ssl" = "1"
+    }
+    error_message = "The cluster parameter group must carry exactly rds.force_ssl. The query-logging parameters do not exist at Aurora cluster level and belong on aws_db_parameter_group.aurora."
+  }
+}
+
+run "aurora_instance_parameter_group" {
+  command = plan
+
+  variables {
+    aurora_query_logging_enabled = true
+  }
+
+  assert {
+    condition     = aws_db_parameter_group.aurora[0].family == "aurora-postgresql18"
+    error_message = "The instance parameter group family must match the cluster's major engine version (18.x)."
+  }
+
+  assert {
+    condition = { for p in aws_db_parameter_group.aurora[0].parameter : p.name => p.value } == {
+      "log_statement"              = "ddl"
+      "log_min_duration_statement" = "1000"
+    }
+    error_message = "The instance parameter group should log DDL and queries slower than 1s, and specifically not log_statement = all, which would copy workflow payloads into CloudWatch."
+  }
+
+  # Not asserted: that the writer and reader actually reference this group.
+  # db_parameter_group_name resolves to aws_db_parameter_group.aurora[0].name,
+  # which name_prefix leaves unknown until apply, so any comparison against it
+  # is an "Unknown condition value" at plan time. The attachment belongs on the
+  # live-validation checklist. Same gap as the module's own RDS parameter group
+  # in tests/defaults.tftest.hcl.
+}
+
+run "aurora_writer_and_reader_match_cluster_engine" {
+  command = plan
+
+  # The instances' `cluster_identifier` field references aws_rds_cluster.n8n.id,
+  # which is computed and unknown at plan time. Asserting the wiring requires
+  # `command = apply`, but applying triggers downstream module validations
+  # (ARN format, JSON policy bodies) that the mocked AWS provider does not
+  # satisfy. Pinning the engine on both instances instead catches the most
+  # common writer/reader-misconfigured regression (someone forgetting to
+  # propagate engine/engine_version on one of the two replicas) without
+  # needing apply.
+
+  assert {
+    condition     = aws_rds_cluster_instance.writer.engine == "aurora-postgresql"
+    error_message = "Writer engine must be aurora-postgresql"
+  }
+
+  assert {
+    condition     = aws_rds_cluster_instance.reader.engine == "aurora-postgresql"
+    error_message = "Reader engine must be aurora-postgresql"
+  }
+
+  assert {
+    condition     = aws_rds_cluster_instance.writer.engine_version == aws_rds_cluster_instance.reader.engine_version
+    error_message = "Writer and reader must run the same engine_version"
+  }
+}
+
+run "aurora_instance_class_propagates_to_both_instances" {
+  command = plan
+
+  variables {
+    aurora_instance_class = "db.r6g.2xlarge"
+  }
+
+  assert {
+    condition     = aws_rds_cluster_instance.writer.instance_class == "db.r6g.2xlarge"
+    error_message = "var.aurora_instance_class must reach writer.instance_class"
+  }
+
+  assert {
+    condition     = aws_rds_cluster_instance.reader.instance_class == "db.r6g.2xlarge"
+    error_message = "var.aurora_instance_class must reach reader.instance_class"
+  }
+}
+
+# ── VPC CNI warm-IP tuning ────────────────────────────────────────────────────
+# Subnet exhaustion at 10+ m7i.4xlarge nodes is gated entirely by these knobs.
+# A regression here silently breaks scaling past ~10 nodes long before any
+# user notices an IP-allocation error.
+
+run "vpc_cni_addon_warm_ip_tuning" {
+  command = plan
+
+  assert {
+    condition     = aws_eks_addon.vpc_cni.addon_name == "vpc-cni"
+    error_message = "vpc_cni addon must target the vpc-cni addon, not amazon-vpc-cni"
+  }
+
+  assert {
+    condition     = jsondecode(aws_eks_addon.vpc_cni.configuration_values).env.WARM_ENI_TARGET == "0"
+    error_message = "WARM_ENI_TARGET must be 0 (default 1 exhausts /20 subnets at scale)"
+  }
+
+  assert {
+    condition     = jsondecode(aws_eks_addon.vpc_cni.configuration_values).env.WARM_IP_TARGET == "2"
+    error_message = "WARM_IP_TARGET must be 2 (limits warm pool to 2 IPs per node)"
+  }
+
+  assert {
+    condition     = jsondecode(aws_eks_addon.vpc_cni.configuration_values).env.MINIMUM_IP_TARGET == "2"
+    error_message = "MINIMUM_IP_TARGET must be 2 to pair with WARM_IP_TARGET"
+  }
+}
+
+# ── Load-validated module inputs ──────────────────────────────────────────────
+# main.tf carries five values that load validation round 2 measured on this
+# deployment class (see the comments beside each): node_disk_size = 100,
+# redis_node_type = "cache.r6g.2xlarge", db_postgresdb_pool_size = 20,
+# n8n_worker_keda_max_replicas = 320, and four PgBouncer replicas. Only the
+# PgBouncer count is pinned at plan time (next section), because it is a
+# resource this configuration creates itself.
+#
+# The other four cannot be asserted here. A run block can only reference the
+# root module's resources, variables and outputs; the module's resources
+# (module.n8n.aws_eks_node_group.n8n, module.n8n.aws_elasticache_cluster.n8n)
+# are "Unsupported attribute" from a test in this directory, the module exposes
+# no output carrying disk_size or node_type, and the values are literals in the
+# module block rather than example variables. The pool size and the KEDA
+# ceiling additionally live only inside the module's helm_release values, which
+# are deferred under the mock providers (see "Known mock provider limitations"
+# in AGENTS.md). The module's own suite pins the node_disk_size and
+# redis_node_type wiring (tests/defaults.tftest.hcl at the repo root); what is
+# unguarded is this example's choice of value.
+#
+# Verify manually with a real `terraform plan` from this directory: the node
+# group shows disk_size = 100 and the cache cluster node_type =
+# "cache.r6g.2xlarge" (confirmed against real providers with no state on
+# 2026-09-04). The helm values are `(known after apply)` in a fresh-create
+# plan even with real providers, because the same yamlencode also carries
+# attributes the module computes at apply time, such as the ElastiCache node
+# address behind local.redis_host (n8n.tf, the queue host and the KEDA
+# trigger address) and aws_iam_role.s3.arn for Pod Identity. One unknown
+# makes the whole string unknown, so DB_POSTGRESDB_POOL_SIZE = 20 and
+# maxReplicaCount = 320 only render in a plan against an existing
+# deployment's state, or after apply via
+# `kubectl get scaledobject -n n8n -o yaml` and
+# `kubectl get deploy n8n-main -n n8n -o yaml`. What plan-time does guarantee
+# is that both arguments are accepted module inputs (`terraform validate`
+# rejects an unknown argument), and n8n.tf references each variable directly.
+
+
+# ── PgBouncer ────────────────────────────────────────────────────────────────
+# Required anti-affinity, four replicas, and the PDB together guarantee that
+# no single-node failure or voluntary drain can take all n8n DB traffic down,
+# and that the client-connection budget stays above the fleet ceiling (see
+# the replica assertion's message). Anti-affinity and the PDB were the
+# live-validated fixes from PR #4; the replica count was raised from two
+# during load validation. Pinning all of it at plan time means a future
+# refactor can't silently regress to `preferred` anti-affinity or an
+# undersized replica count.
+
+run "pgbouncer_namespace_and_replicas" {
+  command = plan
+
+  assert {
+    condition     = kubernetes_namespace.pgbouncer.metadata[0].name == "pgbouncer"
+    error_message = "PgBouncer must run in its own 'pgbouncer' namespace, not in the n8n namespace"
+  }
+
+  assert {
+    # The kubernetes provider returns replicas as a string per its schema, not
+    # an int — compare to "4" rather than 4.
+    condition     = kubernetes_deployment.pgbouncer.spec[0].replicas == "4"
+    error_message = "PgBouncer must run 4 replicas: fewer is a client-connection budget below the fleet ceiling (460 pods x pool_size 20 is about 9,200 potential connections against MAX_CLIENT_CONN 3,000 per replica), and exceeding max_client_conn queues new client connections, recreating the very pool-acquisition backlog the pool sizing exists to prevent"
+  }
+}
+
+run "pgbouncer_required_anti_affinity" {
+  command = plan
+
+  # Anti-affinity must be REQUIRED, not preferred. A preferred rule was
+  # observed losing the race against node-group startup ordering, co-locating
+  # both replicas on the first Ready node — a single-node failure then took
+  # out all n8n DB traffic.
+  assert {
+    condition = length(
+      kubernetes_deployment.pgbouncer.spec[0].template[0].spec[0].affinity[0].pod_anti_affinity[0].required_during_scheduling_ignored_during_execution
+    ) == 1
+    error_message = "PgBouncer pod anti-affinity must be REQUIRED, not preferred"
+  }
+
+  assert {
+    condition = (
+      kubernetes_deployment.pgbouncer.spec[0].template[0].spec[0].affinity[0]
+      .pod_anti_affinity[0].required_during_scheduling_ignored_during_execution[0]
+      .topology_key == "kubernetes.io/hostname"
+    )
+    error_message = "PgBouncer anti-affinity topology_key must be kubernetes.io/hostname (spreads replicas across nodes)"
+  }
+}
+
+run "pgbouncer_pdb_and_clusterip_service" {
+  command = plan
+
+  assert {
+    # The kubernetes provider returns min_available as a string per its schema
+    # (the field also accepts percentages like "20%") — compare to "1" not 1.
+    condition     = kubernetes_pod_disruption_budget_v1.pgbouncer.spec[0].min_available == "1"
+    error_message = "PgBouncer PDB must require at least 1 replica available during voluntary disruptions"
+  }
+
+  assert {
+    condition     = kubernetes_service.pgbouncer.spec[0].type == "ClusterIP"
+    error_message = "PgBouncer service must be ClusterIP — it is only reached from in-cluster n8n pods"
+  }
+
+  assert {
+    condition     = one(kubernetes_service.pgbouncer.spec[0].port).port == 5432
+    error_message = "PgBouncer service must listen on the PostgreSQL port (5432)"
+  }
+}
+
+run "pgbouncer_image_pinned_by_digest" {
+  command = plan
+
+  # Without the @sha256:<digest> suffix, an upstream re-tag of
+  # edoburu/pgbouncer:v1.23.1-p3 would silently change deployed bits on every
+  # fresh apply. The pgbouncer.tf comment near the image field documents the
+  # refresh procedure when bumping the version.
+  assert {
+    condition     = strcontains(kubernetes_deployment.pgbouncer.spec[0].template[0].spec[0].container[0].image, "@sha256:")
+    error_message = "PgBouncer container image must include an @sha256:<digest> suffix to pin to an immutable OCI reference (clears CKV_K8S_43)"
+  }
+}
+
+run "n8n_image_tag_defaults_to_null" {
+  command = plan
+
+  assert {
+    condition     = var.n8n_image_tag == null
+    error_message = "Example must not pin an image tag by default; the module's selected chart default should apply."
+  }
+}
+
+run "n8n_main_hpa_min_replicas_defaults_to_six" {
+  command = plan
+
+  assert {
+    condition     = var.n8n_main_hpa_min_replicas == 6
+    error_message = "Example must default to this tier's own main-replica floor of 6, not the module's generic default of 2."
+  }
+}
+
+run "n8n_image_tag_rejects_whitespace" {
+  command = plan
+
+  variables {
+    n8n_image_tag = " 1.2.3 "
+  }
+
+  expect_failures = [var.n8n_image_tag]
+}
+
+run "n8n_image_repository_defaults_to_null" {
+  command = plan
+
+  assert {
+    condition     = var.n8n_image_repository == null
+    error_message = "Example must not pin an image repository by default; the module's chart default (docker.n8n.io/n8nio/n8n) should apply."
+  }
+}
+
+run "n8n_image_repository_rejects_inline_tag" {
+  command = plan
+
+  variables {
+    n8n_image_repository = "myregistry.example.com/n8n:2.27.4"
+  }
+
+  expect_failures = [var.n8n_image_repository]
+}
+
+run "n8n_task_runner_image_tag_defaults_to_null" {
+  command = plan
+
+  assert {
+    condition     = var.n8n_task_runner_image_tag == null
+    error_message = "Example must not pin a task runner image tag by default; the chart should keep inheriting the n8n application image's tag."
+  }
+}
+
+run "n8n_task_runner_image_tag_rejects_whitespace" {
+  command = plan
+
+  variables {
+    n8n_task_runner_image_tag = " 2.27.4 "
+  }
+
+  expect_failures = [var.n8n_task_runner_image_tag]
+}
+
+run "n8n_task_runner_image_repository_defaults_to_null" {
+  command = plan
+
+  assert {
+    condition     = var.n8n_task_runner_image_repository == null
+    error_message = "Example must not pin a task runner image repository by default; the chart's own repository (n8nio/runners) should apply."
+  }
+}
+
+run "n8n_task_runner_image_repository_rejects_inline_tag" {
+  command = plan
+
+  variables {
+    n8n_task_runner_image_repository = "myregistry.example.com/runners:2.27.4"
+  }
+
+  expect_failures = [var.n8n_task_runner_image_repository]
+}
+
+run "n8n_custom_extensions_path_defaults_to_null" {
+  command = plan
+
+  assert {
+    condition     = var.n8n_custom_extensions_path == null
+    error_message = "Example must not set a custom extensions path by default; N8N_CUSTOM_EXTENSIONS should be omitted unless a custom image supplies nodes at that path."
+  }
+}
+
+run "n8n_custom_extensions_path_rejects_a_relative_path" {
+  command = plan
+
+  variables {
+    n8n_custom_extensions_path = "opt/n8n-nodes"
+  }
+
+  expect_failures = [var.n8n_custom_extensions_path]
+}
+
+run "n8n_custom_extensions_path_rejects_the_chart_mounted_data_dir" {
+  command = plan
+
+  variables {
+    n8n_custom_extensions_path = "/home/node/.n8n/custom"
+  }
+
+  expect_failures = [var.n8n_custom_extensions_path]
+}
+
+run "n8n_custom_extensions_path_rejects_a_non_canonical_path" {
+  command = plan
+
+  variables {
+    n8n_custom_extensions_path = "/home/node/./.n8n/custom"
+  }
+
+  expect_failures = [var.n8n_custom_extensions_path]
+}
+
+run "n8n_image_pull_secrets_defaults_to_empty" {
+  command = plan
+
+  assert {
+    condition     = length(var.n8n_image_pull_secrets) == 0
+    error_message = "Example must not attach image pull secrets by default; the Helm chart should keep creating the n8n ServiceAccount."
+  }
+}
+
+run "n8n_image_pull_secrets_rejects_a_non_dns_name" {
+  command = plan
+
+  variables {
+    n8n_image_pull_secrets = ["Not_A_Secret_Name"]
+  }
+
+  expect_failures = [var.n8n_image_pull_secrets]
+}
+
+run "n8n_image_pull_secrets_rejects_an_overlong_label" {
+  command = plan
+
+  variables {
+    # 64 characters, one past the Kubernetes per-label limit, though well
+    # under the 253-character total-length limit.
+    n8n_image_pull_secrets = ["a${join("", [for i in range(63) : "a"])}"]
+  }
+
+  expect_failures = [var.n8n_image_pull_secrets]
+}
+
+run "execution_data_storage_mode_rejects_filesystem" {
+  command = plan
+
+  variables {
+    n8n_execution_data_storage_mode = "filesystem"
+  }
+
+  expect_failures = [var.n8n_execution_data_storage_mode]
+}
+
+# ── Data-resource deletion controls ───────────────────────────────────────────
+# Only s3_force_destroy is passed through here. The module's db_* deletion
+# controls are deliberately absent: create_database = false means the module
+# manages no RDS instance, so they would be no-ops that only raise the
+# rds_tuning_requires_module_managed_database warning; the Aurora equivalents
+# live on aws_rds_cluster.n8n in aurora.tf. Verify the one wire by reading the
+# module output at its default and again after setting a non-default value.
+
+run "s3_force_destroy_defaults_to_module_teardown_friendly_value" {
+  command = plan
+
+  assert {
+    condition     = module.n8n.s3_force_destroy == true
+    error_message = "s3_force_destroy should pass through as true when the example leaves it at null"
+  }
+}
+
+run "s3_force_destroy_passes_through_to_module" {
+  command = plan
+
+  variables {
+    s3_force_destroy = false
+  }
+
+  assert {
+    condition     = module.n8n.s3_force_destroy == false
+    error_message = "s3_force_destroy must pass from the example to the module"
+  }
+}
+
+# ── AWS Partner Revenue Measurement tag ───────────────────────────────────────
+# The example merges the tag into its own tags (VPC, NAT gateway, stand-in
+# infrastructure) and passes the same value to the module. Whether the module
+# then tags what it creates is asserted in the root tests/defaults.tftest.hcl.
+# local.common_tags is built entirely from known inputs, so it is also known
+# at plan time and is asserted here directly: deleting the tag merge from this
+# example's own main.tf would leave only the variable-contract assertion
+# green, so both are checked.
+
+run "aws_partner_attribution_tag_defaults_to_the_product_code" {
+  command = plan
+
+  assert {
+    condition     = var.aws_partner_attribution_tag == "pc:26au7o6cdeh7fqdt376h9m9xk"
+    error_message = "The example must default to the same product code as the module root"
+  }
+
+  assert {
+    condition     = local.common_tags["aws-apn-id"] == "pc:26au7o6cdeh7fqdt376h9m9xk"
+    error_message = "The example must merge the attribution tag into its own common_tags"
+  }
+}
+
+run "aws_partner_attribution_tag_rejects_a_value_that_is_not_a_product_code" {
+  command = plan
+
+  variables {
+    aws_partner_attribution_tag = "26au7o6cdeh7fqdt376h9m9xk"
+  }
+
+  expect_failures = [var.aws_partner_attribution_tag]
+}
+
+run "aws_partner_attribution_tag_rejects_a_value_over_the_aws_tag_value_limit" {
+  command = plan
+
+  variables {
+    # "pc:" plus 254 characters is 257, one over the 256-character tag value limit.
+    aws_partner_attribution_tag = "pc:${join("", [for i in range(254) : "a"])}"
+  }
+
+  expect_failures = [var.aws_partner_attribution_tag]
+}
+
+# The TLS proxy pass-throughs (n8n_extra_ca_pem, n8n_proxy_hops, n8n_extra_env)
+# are intentionally untested here. The module exposes no output that reflects
+# them, and helm_release.n8n.values is unknown at plan time under mocks, so a
+# run block could only read back the example's own variable. Their contracts
+# (defaults, validations, reserved names) are covered by the repo root's
+# tests/defaults.tftest.hcl. `terraform validate` checks only that the
+# arguments, references and types line up; confirming the rendered result
+# needs a real `terraform plan`.
